@@ -49,8 +49,6 @@ def control_for_request(request: dict) -> Control | None:
         if (value := request.get(name)) is not None:
             lines.append(f"{label}: {value if isinstance(value, str) else json.dumps(value)}")
     details = "\n".join(lines)
-    if len(details) > 2900:
-        return None  # Don't offer approval for a request we can't display in full.
     if kind == "command" and not (request.get("command") or request.get("networkApprovalContext")):
         return None
     return Control(request_id, kind, details, permissions=request.get("permissions") or {})

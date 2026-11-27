@@ -32,7 +32,7 @@ for line in sys.stdin:
         if prompt == "question":
             received = message["result"]["answers"]["language"]["answers"][0]
         else:
-            received = message["result"]["decision"]
+            received = message.get("result", {}).get("decision", "rejected")
         completed(thread, turn, f"decision: {received}")
         continue
     method = message["method"]
@@ -55,19 +55,22 @@ for line in sys.stdin:
                 send({"id": message["id"], "result": {"turn": existing}})
                 continue
         turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
-        if prompt in {"hold", "approve", "question", "finish-before-followup"}:
+        if prompt in {"hold", "approve", "approve-long", "question", "finish-before-followup"}:
             active[thread] = turn
             modes[thread] = prompt
             send({"method": "item/completed", "params": {
                 "threadId": thread, "turnId": turn["id"],
                 "item": {"type": "commandExecution", "status": "completed", "aggregatedOutput": "DO NOT EXPOSE"},
             }})
-            if prompt == "approve":
+            if prompt in {"approve", "approve-long"}:
                 request_id = f"approval-for-{turn['id']}"
                 pending[request_id] = (thread, prompt)
                 send({
                     "id": request_id, "method": "item/commandExecution/requestApproval",
-                    "params": {"threadId": thread, "turnId": turn["id"], "command": "echo test"},
+                    "params": {
+                        "threadId": thread, "turnId": turn["id"], "command": "echo test",
+                        "reason": "Long justification. " * 250 if prompt == "approve-long" else None,
+                    },
                 })
             elif prompt == "question":
                 request_id = f"question-for-{turn['id']}"

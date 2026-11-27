@@ -175,9 +175,12 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             web = AsyncMock()
             card_ready = asyncio.Event()
             buttons = []
+            previews = []
 
             async def post(**kwargs):
                 for block in kwargs.get("blocks", []):
+                    if block["type"] == "section":
+                        previews.append(block["text"]["text"])
                     if block["type"] == "actions":
                         buttons.extend(block["elements"])
                 if buttons and kwargs.get("blocks"):
@@ -210,8 +213,11 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         await job
                         buttons.clear()
                         card_ready.clear()
-                        followup = jobs.create_task(inbox.handle(slack_message("4.000000", "approve", root="1.000000")))
+                        followup = jobs.create_task(inbox.handle(slack_message("4.000000", "approve-long", root="1.000000")))
                         await card_ready.wait()
+                        self.assertIn("Command: echo test", previews[-1])
+                        self.assertIn("[Approval details trimmed]", previews[-1])
+                        self.assertLessEqual(len(previews[-1]), 3000)
                         approve_session = next(
                             button for button in buttons if button["text"]["text"] == "Approve for session"
                         )

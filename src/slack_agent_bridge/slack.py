@@ -177,7 +177,7 @@ class SlackOutput:
                 channel=thread.channel_id, thread_ts=thread.root_ts,
                 text="Codex needs the bridge owner's input.",
                 blocks=[
-                    {"type": "section", "text": plain(control.details)},
+                    {"type": "section", "text": plain(approval_preview(control.details))},
                     {"type": "actions", "elements": buttons},
                 ],
                 unfurl_links=False, unfurl_media=False,
@@ -222,3 +222,11 @@ class SlackOutput:
 
 def plain(text: str) -> dict:
     return {"type": "plain_text", "text": text}
+
+
+def approval_preview(details: str) -> str:
+    limit = 2900
+    if len(details) <= limit:
+        return details
+    notice = "\n… [Approval details trimmed]"
+    return details[:limit - len(notice)].rstrip() + notice
