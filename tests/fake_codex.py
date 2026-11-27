@@ -3,7 +3,6 @@
 import itertools
 import json
 import sys
-import time
 
 threads = itertools.count(1)
 turns = itertools.count(1)
@@ -46,9 +45,17 @@ for line in sys.stdin:
         result = {"thread": {"id": f"codex-{next(threads)}"}}
     elif method == "turn/start":
         thread = params["threadId"]
-        turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
         prompt = params["input"][0]["text"]
-        if prompt in {"hold", "approve", "question", "finish-before-steer"}:
+        finishing = None
+        if (existing := active.pop(thread, None)) is not None:
+            if modes[thread] == "finish-before-followup":
+                finishing = existing
+            else:
+                completed(thread, existing, "steered: " + prompt)
+                send({"id": message["id"], "result": {"turn": existing}})
+                continue
+        turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
+        if prompt in {"hold", "approve", "question", "finish-before-followup"}:
             active[thread] = turn
             modes[thread] = prompt
             send({"method": "item/completed", "params": {
@@ -76,18 +83,10 @@ for line in sys.stdin:
         else:
             # Notifications can arrive before the turn/start response.
             completed(thread, turn, f"{thread}: {prompt}")
+        if finishing is not None:
+            # Both turns' terminal notifications can be in flight before the receipt.
+            completed(thread, finishing, "finished before follow-up")
         result = {"turn": turn}
-    elif method == "turn/steer":
-        thread = params["threadId"]
-        turn = active.pop(thread)
-        assert params["expectedTurnId"] == turn["id"]
-        if modes[thread] == "finish-before-steer":
-            send({"id": message["id"], "error": {"message": "no active turn to steer", "code": -32600}})
-            time.sleep(0.05)
-            completed(thread, turn, "finished before steering")
-            continue
-        completed(thread, turn, "steered: " + params["input"][0]["text"])
-        result = {"turnId": turn["id"]}
     elif method == "turn/interrupt":
         thread = params["threadId"]
         if modes[thread] == "approve":

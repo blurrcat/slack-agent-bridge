@@ -122,7 +122,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         # A follow-up can be posted before its turn actually begins.
         with tempfile.TemporaryDirectory() as tmp, patch(
             "slack_agent_bridge.inbox.time_ns",
-            side_effect=[1_000_000_000, 4_500_000_000, 6_000_000_000, 7_000_000_000],
+            side_effect=[1_000_000_000, 3_000_000_000, 4_500_000_000, 6_000_000_000, 7_000_000_000],
         ):
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST"}))
             web = AsyncMock()
@@ -159,7 +159,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         await last
                         await inbox.handle(slack_message("9.000000", "must not run", root="1.000000"))
             output = [args.kwargs["text"] for args in web.chat_postMessage.await_args_list]
-            self.assertIn("steered: change direction", output)
+            self.assertEqual(output.count("steered: change direction"), 1)
             self.assertIn("Turn interrupted.", output)
             self.assertIn("codex-1: still open", output)
             self.assertNotIn("codex-1: must not run", output)
@@ -275,7 +275,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("decision: Python", [c.kwargs["text"] for c in web.chat_postMessage.await_args_list])
 
 
-    async def test_rejected_steer_waits_for_the_terminal_event_before_starting_a_new_turn(self):
+    async def test_followup_opens_a_new_turn_if_the_old_turn_already_finished(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
             web = AsyncMock()
@@ -290,12 +290,12 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             with SessionStore(Path(tmp) / "state.sqlite3") as store:
                 async with Codex(command) as codex, asyncio.TaskGroup() as jobs:
                     inbox = Inbox(config, "TWORKSPACE", "UBRIDGE", codex, store, SlackOutput(web))
-                    jobs.create_task(inbox.handle(slack_message("1.000000", "finish-before-steer")))
+                    jobs.create_task(inbox.handle(slack_message("1.000000", "finish-before-followup")))
                     async with asyncio.timeout(3):
                         await reached_tool.wait()
                         await inbox.handle(slack_message("2.000000", "next", root="1.000000"))
             replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
-            self.assertIn("finished before steering", replies)
+            self.assertIn("finished before follow-up", replies)
             self.assertEqual(replies.count("codex-1: next"), 1)
 
 

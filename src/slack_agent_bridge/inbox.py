@@ -65,15 +65,6 @@ class Inbox:
                     return
                 else:
                     closing = False
-                    if running := live.running_turn:
-                        try:
-                            await self.codex.steer(running, message.text)
-                        except CodexError as error:
-                            if not error.no_active_turn or not await confirm_stopped(running):
-                                raise
-                        else:
-                            log.info("Steered inbox turn %s for %s/%s", running.id, thread.channel_id, thread.root_ts)
-                            return
                     if live.session.harness_session is None:
                         if not message.is_root:
                             return
@@ -85,8 +76,13 @@ class Inbox:
                     harness = live.session.harness_session
                     assert harness is not None
                     thread_id = harness.thread_id
-                    live.turn_started_at = Decimal(time_ns()) / 1_000_000_000
-                    turn = live.turn = await self.codex.start_turn(thread_id, message.text)
+                    submitted_at = Decimal(time_ns()) / 1_000_000_000
+                    turn = await self.codex.submit(thread_id, message.text)
+                    if turn is live.turn:
+                        log.info("Steered inbox turn %s for %s/%s", turn.id, thread.channel_id, thread.root_ts)
+                        return
+                    live.turn = turn
+                    live.turn_started_at = submitted_at
             if closing:
                 if stopping is not None:
                     await stopping.stopped.wait()
@@ -343,7 +339,7 @@ class SessionStore:
 
 
 async def confirm_stopped(turn: Turn) -> bool:
-    # An explicit no-active-turn response can precede its terminal notification.
+    # An interrupt can report no active turn before the terminal notification arrives.
     try:
         await asyncio.wait_for(turn.stopped.wait(), timeout=2)
     except TimeoutError:

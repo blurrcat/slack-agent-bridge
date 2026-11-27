@@ -17,7 +17,7 @@ Information → App-Level Tokens**, generate an app token (`xapp-…`) with
 
 ## Install and run
 
-Have a working, signed-in Codex CLI on this machine. Install the bridge with
+Have a working, signed-in Codex CLI (0.171.0 or later) on this machine. Install the bridge with
 [uv](https://docs.astral.sh/uv/):
 
 ```sh

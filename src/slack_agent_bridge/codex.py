@@ -26,21 +26,23 @@ class Codex:
         result = await self._request("thread/start", {})
         return result["thread"]["id"]
 
-    async def start_turn(self, thread_id: str, prompt: str) -> Turn:
-        turn = Turn(thread_id)
-        self._turns[thread_id] = turn
+    async def submit(self, thread_id: str, prompt: str) -> Turn:
+        """Start or steer; return the same Turn object if Codex steers it."""
+        if thread_id in self._submitting:
+            raise CodexError("Another input submission is awaiting acknowledgment.")
+        # Keep turns observed before the response, even if they already completed.
+        observed: dict[str, Turn] = {}
+        self._submitting[thread_id] = observed
         try:
             result = await self._request("turn/start", {"threadId": thread_id, "input": text_input(prompt)})
-            turn.id = result["turn"]["id"]
+            turn_id = result["turn"]["id"]
+            key = (thread_id, turn_id)
+            turn = self._turns.get(key) or observed.get(turn_id)
+            if turn is None:
+                turn = self._turns[key] = Turn(thread_id, turn_id)
             return turn
-        except BaseException:
-            self._turns.pop(thread_id, None)
-            raise
-
-    async def steer(self, turn: Turn, prompt: str) -> None:
-        await self._request("turn/steer", {
-            "threadId": turn.thread_id, "expectedTurnId": turn.id, "input": text_input(prompt),
-        })
+        finally:
+            self._submitting.pop(thread_id)
 
     async def interrupt(self, turn: Turn) -> None:
         await self._request("turn/interrupt", {"threadId": turn.thread_id, "turnId": turn.id})
@@ -58,7 +60,8 @@ class Codex:
         self.closed = asyncio.Event()
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
-        self._turns: dict[str, Turn] = {}
+        self._turns: dict[tuple[str, str], Turn] = {}
+        self._submitting: dict[str, dict[str, Turn]] = {}
 
     async def __aenter__(self):
         env = {
@@ -116,7 +119,7 @@ class Codex:
         if "error" in reply:
             reason = str(reply["error"].get("message", "")).strip().lower().rstrip(".")
             raise CodexError(f"Codex rejected {method}.", rejected=True, no_active_turn=reason in {
-                "no active turn", "no active turn to steer", "no active turn to interrupt",
+                "no active turn", "no active turn to interrupt",
             })
         return reply["result"]
 
@@ -130,25 +133,15 @@ class Codex:
                 if request_id is not None:
                     if method is not None:
                         params = message.get("params", {})
-                        turn = self._turns.get(params.get("threadId"))
+                        turn = self._observe_turn(params.get("threadId"), params.get("turnId"))
                         if turn is not None and not turn.stopped.is_set():
                             turn.events.put_nowait(("request", params | {"request_id": request_id, "method": method}))
                         else:
                             await self.reject_request(request_id)
                     elif (future := self._pending.get(request_id)) is not None and not future.done():
                         future.set_result(message)
-                elif method in {"item/completed", "turn/completed", "serverRequest/resolved"}:
-                    params = message["params"]
-                    turn = self._turns.get(params["threadId"])
-                    if turn is not None:
-                        if method == "turn/completed":
-                            if turn.id is not None and params["turn"]["id"] != turn.id:
-                                continue
-                            turn.stopped.set()
-                            self._turns.pop(turn.thread_id, None)
-                        elif method == "serverRequest/resolved":
-                            turn.resolved_requests.add(params["requestId"])
-                        turn.events.put_nowait((method, params))
+                elif method in {"turn/started", "item/completed", "turn/completed", "serverRequest/resolved"}:
+                    self._notify(method, message["params"])
         except (OSError, ValueError, TypeError, KeyError, AttributeError, CodexError) as error:
             log.warning("Could not read Codex stdio (%s).", type(error).__name__)
         finally:
@@ -159,6 +152,40 @@ class Codex:
             for turn in self._turns.values():
                 turn.stopped.set()
                 turn.events.put_nowait(None)
+
+    def _notify(self, method: str, params: dict) -> None:
+        thread_id = params["threadId"]
+        if method == "serverRequest/resolved":
+            for turn in self._turns.values():
+                if turn.thread_id == thread_id:
+                    turn.resolved_requests.add(params["requestId"])
+                    turn.events.put_nowait((method, params))
+            return
+
+        turn_id = params["turn"]["id"] if method in {"turn/started", "turn/completed"} else params["turnId"]
+        turn = self._observe_turn(thread_id, turn_id)
+        if turn is None or turn.stopped.is_set() or method == "turn/started":
+            return
+        if method == "turn/completed":
+            turn.stopped.set()
+            self._turns.pop((thread_id, turn_id))
+            if (observed := self._submitting.get(thread_id)) is not None:
+                observed[turn_id] = turn
+        turn.events.put_nowait((method, params))
+
+    def _observe_turn(self, thread_id: str | None, turn_id: str | None) -> Turn | None:
+        if thread_id is None or turn_id is None:
+            return None
+        key = (thread_id, turn_id)
+        if turn := self._turns.get(key):
+            return turn
+        observed = self._submitting.get(thread_id)
+        if observed is None:
+            return None
+        if turn_id not in observed:
+            turn = observed[turn_id] = self._turns[key] = Turn(thread_id, turn_id)
+            return turn
+        return observed[turn_id]
 
     async def _send(self, message: dict) -> None:
         assert self._process.stdin is not None
@@ -175,14 +202,14 @@ class Codex:
             pass
 
 
-
 def text_input(prompt: str) -> list[dict]:
     return [{"type": "text", "text": prompt, "text_elements": []}]
+
 
 @dataclass(eq=False)
 class Turn:
     thread_id: str
-    id: str | None = None
+    id: str
     interrupting: bool = False
     resolved_requests: set[int | str] = field(default_factory=set)
     stopped: asyncio.Event = field(default_factory=asyncio.Event)
