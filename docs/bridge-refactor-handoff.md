@@ -4,7 +4,7 @@
 
 Keep the bridge simpler and less coupled. Borrow Erlang's mailbox model: one owner of policy state, asynchronous messages, casts by default, and calls only when an immediate result matters. Use plain asyncio, not an actor framework.
 
-Write the new modules from scratch. Do not rename, move, or wrap the existing implementations. Use this handoff and the agreed behavior as the spec, not the old code structure. This handoff does not implement the refactor.
+Write the new modules from scratch. Do not rename, move, or wrap the existing implementations. Use this handoff and the agreed behavior as the spec, not the old code structure. The draft against GitHub main also preserves behavior that landed after the handoff was written.
 
 ## Module layout
 
@@ -18,7 +18,7 @@ Create these files under `src/slack_agent_bridge/`:
 
 ## Dispatch and command semantics
 
-The Bridge owns an unbounded, in-memory `asyncio.Queue[SlackEvent | HarnessEvent]`. One pump per inbound stream reads its async iterator and puts events into the queue. The dispatcher runs:
+The Bridge owns an unbounded, in-memory queue for `SlackEvent` and `HarnessEvent`, plus its private recovery deadline event. One pump per inbound stream reads its async iterator and puts events into the queue. The dispatcher runs:
 
 ```python
 async for event in self.events():
@@ -35,7 +35,7 @@ Supervise the dispatcher, both pumps, and the outbox worker together. If either 
 
 ## Behavior to preserve
 
-- Keep the current authorization rules, including Owner-only approval and close. Preserve prompt, steer, interrupt, and approval flows. **Remove the hourglass.** Don't add recovery or Joined Threads as part of this work. SQLite keeps its role for mappings and deduplication, not event replay.
+- Keep the current authorization rules, including Owner-only approval and close. Preserve prompt, steer, interrupt, and approval flows. **Remove the hourglass.** Keep GitHub main's suppression of tool-status replies and its existing inbox session recovery; don't extend recovery or add Joined Threads. SQLite keeps its role for mappings and deduplication, not event replay.
 - For `!done` or `!end` during an active turn, mark the session closing, cast the interrupt, and return. Don't accept new prompts or approval clicks while closing. A terminal event finishes the close and causes ✅ and “Bye” to be sent in order. If interruption fails and the turn is still active, leave the session open for retry and report the failure.
 - Codex owns approval expiry. Retire and disable the Slack control when Codex reports the request resolved or the turn ends. A click that races with expiry is a no-op: don't retry it or claim that the approval was applied. Resolution alone does not distinguish an answered request from one Codex cleared.
 

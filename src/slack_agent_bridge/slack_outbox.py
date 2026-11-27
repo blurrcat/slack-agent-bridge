@@ -10,7 +10,9 @@ from aiohttp import ClientError
 from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from .events import SlackApprovalCardPosted, SlackApprovalCardPostFailed, SlackEvent, SlackThread
+from .events import (
+    SlackApprovalCardPosted, SlackApprovalCardPostFailed, SlackEvent, SlackMessagePosted, SlackOriginLookedUp, SlackQuestionsOpenFailed, SlackThread,
+)
 
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,9 @@ class SlackOutbox:
     def disable_card(self, thread: SlackThread, ts: str) -> None:
         self._queue.put_nowait(_DisableCard(thread, ts))
 
+    def lookup_origin(self, thread: SlackThread) -> None:
+        self._queue.put_nowait(_LookupOrigin(thread))
+
     def open_questions(self, trigger_id: str, token: str, questions: tuple[ModalQuestion, ...]) -> None:
         self._queue.put_nowait(_Modal(trigger_id, token, questions))
 
@@ -50,6 +55,10 @@ class SlackOutbox:
                 log.warning("Slack %s failed (%s).", type(write).__name__, type(error).__name__)
                 if isinstance(write, _Card):
                     publish(SlackApprovalCardPostFailed(write.token))
+                elif isinstance(write, _Modal):
+                    publish(SlackQuestionsOpenFailed(write.token))
+                elif isinstance(write, _LookupOrigin):
+                    publish(SlackOriginLookedUp(write.thread, None))
             else:
                 if outcome is not None:
                     publish(outcome)
@@ -60,13 +69,13 @@ class SlackOutbox:
                 await self._web.reactions_add(channel=thread.channel_id, timestamp=thread.root_ts, name=emoji)
             case _Reply(thread, text):
                 await self._web.chat_postMessage(
-                    channel=thread.channel_id, thread_ts=thread.root_ts, text=text,
+                    channel=thread.channel_id, thread_ts=thread.root_ts, text=_escape(text),
                     unfurl_links=False, unfurl_media=False,
                 )
             case _Card(thread, token, text, buttons):
                 response = await self._web.chat_postMessage(
-                    channel=thread.channel_id, thread_ts=thread.root_ts, text=text,
-                    unfurl_links=False, unfurl_media=False,
+                    channel=thread.channel_id, thread_ts=thread.root_ts,
+                    text="Codex needs the bridge owner's input.", unfurl_links=False, unfurl_media=False,
                     blocks=[
                         {"type": "section", "text": _plain(_preview(text))},
                         {"type": "actions", "elements": [
@@ -86,6 +95,11 @@ class SlackOutbox:
                 ])
             case _Modal(trigger_id, token, questions):
                 await self._web.views_open(trigger_id=trigger_id, view=_modal(token, questions))
+            case _LookupOrigin(thread):
+                response = await self._web.conversations_history(
+                    channel=thread.channel_id, latest=thread.root_ts, inclusive=True, limit=1,
+                )
+                return SlackOriginLookedUp(thread, _exact_origin(thread, response.get("messages")))
         return None
 
 
@@ -129,7 +143,12 @@ class _Modal:
     questions: tuple[ModalQuestion, ...]
 
 
-_Write = _Reaction | _Reply | _Card | _DisableCard | _Modal
+@dataclass(frozen=True)
+class _LookupOrigin:
+    thread: SlackThread
+
+
+_Write = _Reaction | _Reply | _Card | _DisableCard | _Modal | _LookupOrigin
 
 
 def _modal(token: str, questions: tuple[ModalQuestion, ...]) -> dict[str, Any]:
@@ -159,3 +178,24 @@ def _plain(text: str) -> dict[str, str]:
 def _preview(text: str) -> str:
     suffix = "\n\n[Approval details trimmed]"
     return text if len(text) <= 3000 else text[:3000 - len(suffix)] + suffix
+
+
+def _escape(text: str) -> str:
+    # Keep Markdown formatting without activating Slack mentions or special links.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _exact_origin(thread: SlackThread, messages: object) -> SlackMessagePosted | None:
+    if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
+        return None
+    record = messages[0]
+    text = record.get("text")
+    if record.get("ts") != thread.root_ts or record.get("thread_ts", thread.root_ts) != thread.root_ts:
+        return None
+    if not isinstance(text, str):
+        return None
+    user, bot, subtype = (record.get(key) for key in ("user", "bot_id", "subtype"))
+    return SlackMessagePosted(thread, thread.root_ts, thread.root_ts, text,
+                              user if isinstance(user, str) else None,
+                              bot if isinstance(bot, str) else None,
+                              subtype if isinstance(subtype, str) else None)

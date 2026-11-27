@@ -5,7 +5,8 @@ import json
 import sys
 from pathlib import Path
 
-threads = itertools.count(1)
+mode = sys.argv[2] if len(sys.argv) > 2 else ""
+threads = itertools.count(1 if not mode.startswith("missing") else 2)
 turns = itertools.count(1)
 active = {}
 pending = {}
@@ -76,6 +77,12 @@ for line in sys.stdin:
             with Path(sys.argv[1]).open("a") as file:
                 file.write("started\n")
         result = {"thread": {"id": f"codex-{next(threads)}"}}
+    elif method == "thread/resume":
+        thread_id = params["threadId"]
+        if mode.startswith("missing"):
+            send({"id": message["id"], "error": {"code": -32600, "message": f"no rollout found for thread id {thread_id}"}})
+            continue
+        result = {"thread": {"id": thread_id}}
     elif method == "turn/start":
         thread = params["threadId"]
         prompt = params["input"][0]["text"]
@@ -103,8 +110,9 @@ for line in sys.stdin:
             }})
             approval(thread, turn, prompt)
             continue
-        if prompt == "ack-only-after-interrupt":
-            interrupt_acks[thread] = message["id"]
+        if prompt in {"ack-only-after-interrupt", "ack-never-after-terminal"}:
+            if prompt == "ack-only-after-interrupt":
+                interrupt_acks[thread] = message["id"]
             active[thread] = turn
             modes[thread] = prompt
             send({"method": "item/completed", "params": {
@@ -112,6 +120,16 @@ for line in sys.stdin:
                 "item": {"type": "commandExecution", "status": "completed"},
             }})
             approval(thread, turn, prompt)
+            continue
+        if "SLACK_CONTEXT_READY" in prompt:
+            if mode == "missing-history-stalled":
+                active[thread] = turn
+                modes[thread] = mode
+                send({"id": message["id"], "result": {"turn": turn}})
+                continue
+            text = ("history not available" if mode == "missing-history-failure" else "SLACK_CONTEXT_READY")
+            completed(thread, turn, text)
+            send({"id": message["id"], "result": {"turn": turn}})
             continue
         if prompt in {"hold", "approve", "approve-long", "question", "secret-question", "finish-before-followup", "expire-on-steer"}:
             active[thread] = turn

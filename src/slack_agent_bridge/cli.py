@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from time import time_ns
 
 from aiohttp import ClientError, ClientSession
 from slack_sdk.errors import SlackApiError
@@ -64,7 +65,7 @@ async def serve(config: Config, database: Path) -> None:
                 inbox = SlackInbox(socket)
                 outbox = SlackOutbox(web)
                 await Bridge(config, inbox, harness, outbox, database, workspace_id, user_id,
-                             bot_id if isinstance(bot_id, str) else None).run()
+                             bot_id if isinstance(bot_id, str) else None, fresh_since_ns=time_ns()).run()
         except* (HarnessError, BridgeError, OSError, ClientError, sqlite3.Error) as failures:
             raise BridgeError(_failure_message(failures)) from None
 

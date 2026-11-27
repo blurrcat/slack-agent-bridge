@@ -93,7 +93,9 @@ def _decode(request: SocketModeRequest) -> SlackEvent | None:
 
 
 def _interaction(payload: dict[str, Any]) -> SlackInteractionReceived | None:
-    workspace = _string(_object(payload.get("team")).get("id"))
+    workspace = (
+        _string(_object(payload.get("team")).get("id")) or _string(payload.get("app_installed_team_id"))
+    )
     user = _string(_object(payload.get("user")).get("id"))
     if not workspace or not user:
         return None

@@ -28,6 +28,10 @@ class HarnessError(RuntimeError):
         self.no_active_turn = no_active_turn
 
 
+class HarnessSessionMissing(HarnessError):
+    pass
+
+
 class Harness:
     """A single app-server connection with a FIFO of prompt submissions per session."""
 
@@ -49,10 +53,19 @@ class Harness:
         session_id = _object(response.get("thread")).get("id")
         if not isinstance(session_id, str) or not session_id:
             raise HarnessError("Codex returned no session ID.")
+        self._attach_session(session_id)
+        return session_id
+
+    async def resume_session(self, session_id: str) -> None:
+        response = await self._rpc("thread/resume", {"threadId": session_id, "excludeTurns": True}, timeout=5)
+        if _object(response.get("thread")).get("id") != session_id:
+            raise HarnessError("Codex did not confirm the mapped session.")
+        self._attach_session(session_id)
+
+    def _attach_session(self, session_id: str) -> None:
         session = _Session()
         self._sessions[session_id] = session
         session.worker = self._spawn(self._run_session(session_id, session))
-        return session_id
 
     def send_message(self, session_id: str, command_id: str, text: str) -> None:
         self._sessions[session_id].commands.put_nowait(_Prompt(command_id, text))
@@ -128,11 +141,15 @@ class Harness:
                     for turn_id, turn in list(session.turns.items()):
                         await self._stop_turn(session_id, turn_id, turn)
                         await turn.completed.wait()
-                    if session.finished_during_submit is None and not session.turns:
-                        break
+                    if not session.turns:
+                        if session.finished_during_submit is None:
+                            break
+                        if session.turn_started_during_submit in session.finished_during_submit:
+                            # The wire showed this submission's turn start and finish. A late
+                            # receipt is no reason to keep a confirmed stop open.
+                            break
                     # A submission may still announce a turn even before its reply arrives.
                     await session.changed.wait()
-                await self._rpc("thread/unsubscribe", {"threadId": session_id}, timeout=5)
         except (HarnessError, TimeoutError):
             self._events.put_nowait(HarnessCommandFailed(session_id, command_id, "stop"))
         else:
@@ -140,9 +157,15 @@ class Harness:
             session.worker.cancel()
             self._sessions.pop(session_id)
             self._events.put_nowait(HarnessSessionStopped(session_id))
+            try:
+                await self._rpc("thread/unsubscribe", {"threadId": session_id}, timeout=5)
+            except HarnessError as error:
+                # The turns are already stopped. Unloading the thread is best effort.
+                log.warning("Unable to unsubscribe stopped Codex session: %s", error)
 
     async def _submit(self, session_id: str, session: _Session, command: _Prompt) -> None:
         session.finished_during_submit = set()
+        session.turn_started_during_submit = None
         try:
             result = await self._rpc("turn/start", {
                 "threadId": session_id,
@@ -188,24 +211,24 @@ class Harness:
                 turn.interrupt_acknowledged = True
 
     async def _respond(self, key: HarnessRequestKey, response: ApprovalDecision | InputAnswers | None) -> None:
-        index = (key.session_id, key.request_id)
-        pending = self._requests.get(index)
-        if pending is None or pending.key != key or pending.answered:
-            return
-        pending.answered = True
-        if response is None:
-            await self._reject_wire(key.request_id)
-        elif isinstance(response, tuple):
-            await self._send({"id": key.request_id, "result": {
-                "answers": {name: {"answers": [value]} for name, value in response},
-            }})
-        elif pending.permissions is not None:
-            await self._send({"id": key.request_id, "result": {
-                "permissions": {} if response == "decline" else pending.permissions,
-                "scope": "session" if response == "acceptForSession" else "turn",
-            }})
-        else:
-            await self._send({"id": key.request_id, "result": {"decision": response}})
+        async with self._write_lock:
+            pending = self._requests.get((key.session_id, key.request_id))
+            if pending is None or pending.key != key or pending.answered:
+                return
+            pending.answered = True
+            message: Wire = {"id": key.request_id}
+            if response is None:
+                message["error"] = _unsupported_request()
+            elif isinstance(response, tuple):
+                message["result"] = {"answers": {name: {"answers": [value]} for name, value in response}}
+            elif pending.permissions is not None:
+                message["result"] = {
+                    "permissions": {} if response == "decline" else pending.permissions,
+                    "scope": "session" if response == "acceptForSession" else "turn",
+                }
+            else:
+                message["result"] = {"decision": response}
+            await self._write_wire(message)
 
     async def _read(self) -> None:
         stdout = self._process.stdout
@@ -243,6 +266,8 @@ class Harness:
             return
         match method:
             case "turn/started":
+                if turn_id not in session.turns and session.finished_during_submit is not None:
+                    session.turn_started_during_submit = turn_id
                 self._observe_turn(session_id, session, turn_id)
             case "item/completed":
                 item = _object(params.get("item"))
@@ -295,7 +320,7 @@ class Harness:
                 self._events.put_nowait(HarnessRequestResolved(pending.key))
 
     async def _reject_wire(self, request_id: int | str) -> None:
-        await self._send({"id": request_id, "error": {"code": -32601, "message": "Request not supported here."}})
+        await self._send({"id": request_id, "error": _unsupported_request()})
 
     async def _rpc(self, method: str, params: Wire, *, timeout: float = 30) -> Wire:
         request_id = next(self._ids)
@@ -311,17 +336,26 @@ class Harness:
             self._rpcs.pop(request_id, None)
         if "error" in reply:
             reason = _string(_object(reply["error"]).get("message")) or ""
-            raise HarnessError(f"Codex rejected {method}.", no_active_turn=reason.strip().lower().rstrip(".") in {
+            reason = reason.strip().lower().rstrip(".")
+            if method == "thread/resume" and (
+                reason.startswith("no rollout found for thread id ")
+                or reason in {"thread not found", "session not found"}
+            ):
+                raise HarnessSessionMissing("Codex could not find the mapped session.")
+            raise HarnessError(f"Codex rejected {method}.", no_active_turn=reason in {
                 "no active turn", "no active turn to interrupt",
             })
         return _object(reply.get("result"))
 
     async def _send(self, message: Wire) -> None:
+        async with self._write_lock:
+            await self._write_wire(message)
+
+    async def _write_wire(self, message: Wire) -> None:
         stdin = self._process.stdin
         assert stdin is not None
-        async with self._write_lock:
-            stdin.write(json.dumps(message).encode() + b"\n")
-            await stdin.drain()
+        stdin.write(json.dumps(message).encode() + b"\n")
+        await stdin.drain()
 
     async def _drain_stderr(self) -> None:
         stderr = self._process.stderr
@@ -357,6 +391,7 @@ class _Session:
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     turns: dict[str, _Turn] = field(default_factory=dict)
     finished_during_submit: set[str] | None = None
+    turn_started_during_submit: str | None = None
 
 
 @dataclass
@@ -397,6 +432,10 @@ def _decode_request(method: str, params: Wire) -> HarnessApproval | HarnessQuest
     raw_decisions = params.get("availableDecisions")
     decisions = tuple(value for value in raw_decisions if isinstance(value, str)) if isinstance(raw_decisions, list) else None
     return HarnessApproval(kind, details, decisions)
+
+
+def _unsupported_request() -> Wire:
+    return {"code": -32601, "message": "Request not supported here."}
 
 
 def _object(value: object) -> Wire:

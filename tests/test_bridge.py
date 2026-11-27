@@ -35,10 +35,18 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.message("2.000000", "!done", root="1.000000")
             await slack.posted("1.000000", "Bye.")
 
+    async def test_terminal_turn_closes_even_if_prompt_ack_never_comes(self):
+        async with running_bridge() as slack:
+            await slack.message("1.000000", "ack-never-after-terminal")
+            await slack.card("1.000000")
+            await slack.message("2.000000", "!done", root="1.000000")
+            await slack.posted("1.000000", "Bye.")
+
     async def test_workflow_bot_is_authorized_by_bot_id_and_cannot_reply(self):
         async with running_bridge() as slack:
             await slack.message("1.000000", "unknown bot", bot="BUNKNOWN")
             await slack.message("2.000000", "itself", bot="BSELF")
+            await slack.message("2.100000", "!join https://example.test/archives/thread")
             await slack.message("3.000000", "authorized", bot="BFLOW")
             await slack.message("3.000000", "duplicate", bot="BFLOW")
             await slack.posted("3.000000", "codex-1: authorized")
@@ -175,6 +183,76 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.message("1.000000", "approve")
             await slack.posted("1.000000", "decision: rejected")
 
+    async def test_existing_session_resumes_without_replaying_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            async with running_bridge(database=database) as slack:
+                await slack.message("1.000000", "original", user="UGUEST")
+                await slack.posted("1.000000", "codex-1: original")
+                await slack.message("2.000000", "already accepted", root="1.000000", user="UGUEST")
+                await slack.posted("1.000000", "codex-1: already accepted")
+            async with running_bridge(database=database, mode="resume") as slack:
+                await slack.message("1.000000", "original", user="UGUEST")
+                await slack.message("2.000000", "already accepted", root="1.000000", user="UGUEST")
+                await slack.message("3.000000", "not authorized", root="1.000000", user="UOTHER")
+                await slack.message("4.000000", "again", root="1.000000", user="UGUEST")
+                await slack.posted("1.000000", "codex-1: again")
+                self.assertEqual([v["text"] for name, v in slack.observed if name == "chat_postMessage"],
+                                 ["codex-1: again"])
+
+    async def test_missing_mapping_requires_a_verified_slack_origin(self):
+        origin = {"ts": "1.000000", "user": "UGUEST", "text": "old prompt"}
+        async with running_bridge(mode="missing", origin=origin) as slack:
+            await slack.message("2.000000", "not my session", root="1.000000", user="UOTHER")
+            await slack.message("3.000000", "new prompt", root="1.000000", user="UGUEST")
+            await slack.posted("1.000000", "codex-2: new prompt")
+            self.assertEqual([v["text"] for name, v in slack.observed if name == "chat_postMessage"],
+                             ["codex-2: new prompt"])
+
+    async def test_missing_mapped_session_does_not_run_prompt_when_priming_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            async with running_bridge(database=database) as slack:
+                await slack.message("1.000000", "original")
+                await slack.posted("1.000000", "codex-1: original")
+            async with running_bridge(database=database, mode="missing-history-failure") as slack:
+                await slack.message("2.000000", "do not run", root="1.000000")
+                await slack.posted("1.000000", "Codex could not recover the Slack thread history. Your prompt was not run.")
+                self.assertEqual([v["text"] for name, v in slack.observed if name == "chat_postMessage"],
+                                 ["Codex could not recover the Slack thread history. Your prompt was not run."])
+
+    async def test_stalled_recovery_reports_failure_without_running_prompt(self):
+        origin = {"ts": "1.000000", "user": "UOWNER", "text": "old prompt"}
+        async with running_bridge(mode="missing-history-stalled", origin=origin, recovery_timeout=0.1) as slack:
+            await slack.message("2.000000", "must not run", root="1.000000")
+            await slack.posted("1.000000", "Codex could not recover the Slack thread history. Your prompt was not run.")
+            self.assertFalse(any("must not run" in v.get("text", "") for _, v in slack.observed))
+
+    async def test_agent_text_cannot_trigger_slack_mentions(self):
+        async with running_bridge() as slack:
+            await slack.message("1.000000", "say <@UOTHER> and <!channel>")
+            await slack.posted("1.000000", "codex-1: say &lt;@UOTHER&gt; and &lt;!channel&gt;")
+
+    async def test_modal_failure_allows_owner_to_retry(self):
+        attempts = 0
+
+        async def fail_first_modal(method, _args):
+            nonlocal attempts
+            if method == "views_open":
+                attempts += 1
+                if attempts == 1:
+                    raise TimeoutError
+
+        async with running_bridge(before_write=fail_first_modal) as slack:
+            await slack.message("1.000000", "question")
+            card = await slack.card("1.000000")
+            await slack.click(card, "Answer")
+            await slack.posted("1.000000", "Could not open the input form. Click Answer again to retry.")
+            await slack.click(card, "Answer")
+            modal = (await slack.find("views_open", lambda _: True))["view"]
+            await slack.submit(modal, "Python")
+            await slack.posted("1.000000", "decision: Python")
+
     async def test_long_approval_preview_is_trimmed_without_losing_buttons(self):
         async with running_bridge() as slack:
             await slack.message("1.000000", "approve-long")
@@ -183,22 +261,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Command: echo test", preview)
             self.assertIn("[Approval details trimmed]", preview)
             self.assertLessEqual(len(preview), 3000)
+            self.assertNotIn("Long justification", card["text"])
             await slack.click(card, "Decline")
             await slack.posted("1.000000", "decision: decline")
 
 
 @asynccontextmanager
-async def running_bridge(*, before_write=None):
+async def running_bridge(*, before_write=None, database=None, mode="", origin=None, recovery_timeout=60):
     config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test",
-                    frozenset({"UGUEST"}), frozenset({"BFLOW", "BSELF"}))
+                    frozenset({"UGUEST", "UOTHER"}), frozenset({"BFLOW", "BSELF"}))
     slack = SlackHarness(before_write)
+    slack.web.conversations_history.return_value = {"messages": [origin] if origin else []}
     with tempfile.TemporaryDirectory() as tmp:
         trace = Path(tmp) / "harness.log"
-        command = (sys.executable, str(Path(__file__).with_name("fake_codex.py")), str(trace))
+        command = (sys.executable, str(Path(__file__).with_name("fake_codex.py")), str(trace), mode)
         slack.harness_trace = trace
         async with Harness(command) as harness:
             bridge = Bridge(config, SlackInbox(slack.socket), harness, SlackOutbox(slack.web),
-                            Path(tmp) / "state.sqlite3", "TWORKSPACE", "UBRIDGE", "BSELF")
+                            database or Path(tmp) / "state.sqlite3", "TWORKSPACE", "UBRIDGE", "BSELF",
+                            recovery_timeout=recovery_timeout)
             task = asyncio.create_task(bridge.run())
             try:
                 async with asyncio.timeout(5):

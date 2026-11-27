@@ -80,6 +80,17 @@ class SlackApprovalCardPostFailed(SlackEvent):
 
 
 @dataclass(frozen=True)
+class SlackOriginLookedUp(SlackEvent):
+    thread: SlackThread
+    origin: SlackMessagePosted | None
+
+
+@dataclass(frozen=True)
+class SlackQuestionsOpenFailed(SlackEvent):
+    token: str
+
+
+@dataclass(frozen=True)
 class HarnessEvent:
     pass
 
