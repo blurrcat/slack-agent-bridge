@@ -127,6 +127,8 @@ class Bridge:
         self._outbox.started(event.thread)
         log.info("Opened Agent Session for %s/%s", event.thread.channel_id, event.thread.root_ts)
         self._harness.send_message(session_id, event.event_id, event.text)
+        for reply in self._awaiting_origin.pop(event.thread, []):
+            await self._on_reply_posted(reply)
 
     async def _on_reply_posted(self, event: SlackReplyPosted) -> None:
         if not self._fresh(event) or not self._inbox_message(event) or event.bot_id:
@@ -200,6 +202,8 @@ class Bridge:
 
     async def _on_origin_looked_up(self, event: SlackOriginLookedUp) -> None:
         waiting = self._awaiting_origin.pop(event.thread, [])
+        if not waiting:
+            return
         origin = event.origin
         if origin is None or (initiator := self._origin_initiator(origin)) is None:
             # An actual root event might have arrived while the lookup was pending.

@@ -3,6 +3,7 @@
 import itertools
 import json
 import sys
+import time
 from pathlib import Path
 
 mode = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -39,6 +40,15 @@ def approval(thread, turn, prompt):
             "reason": "Long justification. " * 250 if prompt == "approve-long" else None,
         },
     })
+
+
+def wait_for_gate(suffix):
+    gate = Path(sys.argv[1]).with_suffix(suffix)
+    deadline = time.monotonic() + 4
+    while not gate.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"missing test gate {suffix}")
+        time.sleep(0.005)
 
 
 for line in sys.stdin:
@@ -79,8 +89,15 @@ for line in sys.stdin:
         result = {"thread": {"id": f"codex-{next(threads)}"}}
     elif method == "thread/resume":
         thread_id = params["threadId"]
+        if mode == "resume-wrong-id":
+            send({"id": message["id"], "error": {
+                "code": -32600, "message": "no rollout found for thread id other-thread",
+            }})
+            continue
         if mode.startswith("missing"):
-            send({"id": message["id"], "error": {"code": -32600, "message": f"no rollout found for thread id {thread_id}"}})
+            send({"id": message["id"], "error": {
+                "code": -32600, "message": f"invalid thread-store request: no rollout found for thread id {thread_id}",
+            }})
             continue
         result = {"thread": {"id": thread_id}}
     elif method == "turn/start":
@@ -102,6 +119,21 @@ for line in sys.stdin:
                 continue
         turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
         send({"method": "turn/started", "params": {"threadId": thread, "turn": turn}})
+        if prompt == "pause-wire-for-expiry":
+            approval(thread, turn, prompt)
+            send({"id": message["id"], "result": {"turn": turn}})
+            wait_for_gate(".expire")
+            request_id = f"approval-for-{turn['id']}"
+            del pending[request_id]
+            send({"method": "serverRequest/resolved", "params": {
+                "threadId": thread, "requestId": request_id,
+            }})
+            wait_for_gate(".resume")
+            continue
+        if prompt.startswith("large:"):
+            completed(thread, turn, "large prompt accepted")
+            send({"id": message["id"], "result": {"turn": turn}})
+            continue
         if prompt == "wait-for-other-approval":
             held_ack = (thread, turn, message["id"])
             send({"method": "item/completed", "params": {
@@ -110,8 +142,8 @@ for line in sys.stdin:
             }})
             approval(thread, turn, prompt)
             continue
-        if prompt in {"ack-only-after-interrupt", "ack-never-after-terminal"}:
-            if prompt == "ack-only-after-interrupt":
+        if prompt in {"ack-only-after-interrupt", "ack-never-after-terminal", "hold-ack-reject-interrupt"}:
+            if prompt != "ack-never-after-terminal":
                 interrupt_acks[thread] = message["id"]
             active[thread] = turn
             modes[thread] = prompt
@@ -164,8 +196,10 @@ for line in sys.stdin:
         result = {"status": "unsubscribed"}
     elif method == "turn/interrupt":
         thread = params["threadId"]
-        if modes[thread] == "approve":
+        if modes[thread] in {"approve", "hold-ack-reject-interrupt"}:
             send({"id": message["id"], "error": {"message": "interrupt rejected", "code": -32600}})
+            if thread in interrupt_acks:
+                send({"id": interrupt_acks.pop(thread), "result": {"turn": active[thread]}})
             continue
         turn = active.pop(thread)
         assert params["turnId"] == turn["id"]

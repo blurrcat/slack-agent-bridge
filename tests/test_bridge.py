@@ -42,6 +42,15 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.message("2.000000", "!done", root="1.000000")
             await slack.posted("1.000000", "Bye.")
 
+    async def test_rejected_close_preserves_previously_accepted_queued_prompts(self):
+        async with running_bridge() as slack:
+            await slack.message("1.000000", "hold-ack-reject-interrupt")
+            await slack.card("1.000000")
+            await slack.message("2.000000", "queued prompt", root="1.000000")
+            await slack.message("3.000000", "!done", root="1.000000")
+            await slack.posted("1.000000", "Codex did not confirm the session stopped. You can retry !done.")
+            await slack.posted("1.000000", "steered: queued prompt")
+
     async def test_workflow_bot_is_authorized_by_bot_id_and_cannot_reply(self):
         async with running_bridge() as slack:
             await slack.message("1.000000", "unknown bot", bot="BUNKNOWN")
@@ -154,8 +163,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await entered.wait()
             await slack.message("2.000000", "second session")
             # A second start gets to the app server before any of its Slack writes.
-            while not slack.harness_trace.exists() or slack.harness_trace.read_text().count("started\n") != 2:
-                await asyncio.sleep(0.005)
+            await slack.wait_for_harness_starts(2)
             self.assertEqual(slack.observed, [])
             release.set()
             await slack.posted("2.000000", "codex-2: second session")
@@ -208,6 +216,40 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.posted("1.000000", "codex-2: new prompt")
             self.assertEqual([v["text"] for name, v in slack.observed if name == "chat_postMessage"],
                              ["codex-2: new prompt"])
+
+    async def test_root_arriving_during_origin_lookup_does_not_reorder_replies(self):
+        lookup_started = asyncio.Event()
+        lookup_released = asyncio.Event()
+
+        async def delayed_origin(*, channel, latest, **_):
+            lookup_started.set()
+            await lookup_released.wait()
+            return {"messages": [{"ts": latest, "user": "UOWNER", "text": "origin"}]}
+
+        async with running_bridge() as slack:
+            slack.web.conversations_history.side_effect = delayed_origin
+            await slack.message("2.000000", "first reply", root="1.000000")
+            await lookup_started.wait()
+            await slack.message("1.000000", "origin")
+            await slack.message("3.000000", "second reply", root="1.000000")
+            await slack.message("4.000000", "barrier")
+            await slack.wait_for_harness_starts(2)
+            lookup_released.set()
+            await slack.posted("1.000000", "codex-1: second reply")
+            await slack.posted("1.000000", "codex-1: first reply")
+            replies = [value["text"] for name, value in slack.observed
+                       if name == "chat_postMessage" and value.get("thread_ts") == "1.000000"]
+            self.assertEqual(replies, ["codex-1: origin", "codex-1: first reply", "codex-1: second reply"])
+
+    async def test_unknown_resume_failure_does_not_start_a_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            async with running_bridge(database=database) as slack:
+                await slack.message("1.000000", "origin")
+                await slack.posted("1.000000", "codex-1: origin")
+            async with running_bridge(database=database, mode="resume-wrong-id") as slack:
+                await slack.message("2.000000", "must not run", root="1.000000")
+                await slack.posted("1.000000", "Codex did not confirm the prompt. The bridge did not retry it.")
 
     async def test_missing_mapped_session_does_not_run_prompt_when_priming_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -352,6 +394,10 @@ class SlackHarness:
                 "state": {"values": {"q0": {"answer": {"selected_option": {"value": answer}}}}},
             },
         })
+
+    async def wait_for_harness_starts(self, count):
+        while not self.harness_trace.exists() or self.harness_trace.read_text().count("started\n") < count:
+            await asyncio.sleep(0.005)
 
     async def find(self, method, predicate):
         while True:

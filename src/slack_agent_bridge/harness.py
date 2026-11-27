@@ -64,6 +64,7 @@ class Harness:
 
     def _attach_session(self, session_id: str) -> None:
         session = _Session()
+        session.can_submit.set()
         self._sessions[session_id] = session
         session.worker = self._spawn(self._run_session(session_id, session))
 
@@ -72,8 +73,7 @@ class Harness:
 
     def stop_session(self, session_id: str, command_id: str) -> None:
         session = self._sessions[session_id]
-        while not session.commands.empty():
-            session.commands.get_nowait()
+        session.can_submit.clear()
         self._spawn(self._stop_session(session_id, session, command_id))
 
     def interrupt(self, session_id: str, turn_id: str, command_id: str) -> None:
@@ -131,7 +131,9 @@ class Harness:
 
     async def _run_session(self, session_id: str, session: _Session) -> None:
         while True:
-            await self._submit(session_id, session, await session.commands.get())
+            prompt = await session.commands.get()
+            await session.can_submit.wait()
+            await self._submit(session_id, session, prompt)
 
     async def _stop_session(self, session_id: str, session: _Session, command_id: str) -> None:
         try:
@@ -152,6 +154,7 @@ class Harness:
                     await session.changed.wait()
         except (HarnessError, TimeoutError):
             self._events.put_nowait(HarnessCommandFailed(session_id, command_id, "stop"))
+            session.can_submit.set()
         else:
             assert session.worker is not None
             session.worker.cancel()
@@ -335,13 +338,12 @@ class Harness:
         finally:
             self._rpcs.pop(request_id, None)
         if "error" in reply:
-            reason = _string(_object(reply["error"]).get("message")) or ""
-            reason = reason.strip().lower().rstrip(".")
-            if method == "thread/resume" and (
-                reason.startswith("no rollout found for thread id ")
-                or reason in {"thread not found", "session not found"}
-            ):
-                raise HarnessSessionMissing("Codex could not find the mapped session.")
+            error = _object(reply["error"])
+            reason = (_string(error.get("message")) or "").strip().lower().rstrip(".")
+            if method == "thread/resume" and error.get("code") in {-32600, -32603}:
+                missing = f"no rollout found for thread id {params['threadId'].lower()}"
+                if reason in {missing, f"invalid thread-store request: {missing}"}:
+                    raise HarnessSessionMissing("Codex could not find the mapped session.")
             raise HarnessError(f"Codex rejected {method}.", no_active_turn=reason in {
                 "no active turn", "no active turn to interrupt",
             })
@@ -389,6 +391,7 @@ class _Session:
     commands: asyncio.Queue[_Prompt] = field(default_factory=asyncio.Queue)
     worker: asyncio.Task[None] | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    can_submit: asyncio.Event = field(default_factory=asyncio.Event)
     turns: dict[str, _Turn] = field(default_factory=dict)
     finished_during_submit: set[str] | None = None
     turn_started_during_submit: str | None = None
