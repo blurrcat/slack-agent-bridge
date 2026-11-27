@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slack-agent-bridge"
+version = "0.1.0"
+description = "Run your locally configured Codex harness from Slack threads."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["aiohttp", "slack-sdk"]
+
+[project.scripts]
+slack-agent-bridge = "slack_agent_bridge.cli:main"

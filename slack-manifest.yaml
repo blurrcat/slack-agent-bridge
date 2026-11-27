@@ -1,0 +1,16 @@
+display_information:
+  name: Slack Agent Bridge
+features:
+  bot_user:
+    display_name: Slack Agent Bridge
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - groups:history
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.groups
+  socket_mode_enabled: true
