@@ -44,9 +44,11 @@ Optional JSON fields:
 Post a new top-level message from an authorized sender. The bridge adds 👀
 when the Codex session opens and posts the first reply under that message.
 This slice does not handle follow-ups, commands, or session recovery yet.
-The bridge stores its SQLite state in WAL mode beside the config file. Run only one
-instance per inbox. Stop the bridge before copying its database to another host;
-don't copy only the main database file while writes are active.
+The SQLite database uses WAL and lives at
+`$XDG_STATE_HOME/slack-agent-bridge/state.sqlite3` (default:
+`~/.local/state/slack-agent-bridge/state.sqlite3`). The `--config` flag does
+not change this path. Run only one instance per inbox. Stop the bridge
+before copying its database to another host.
 
 ## Tests
 

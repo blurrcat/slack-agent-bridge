@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -8,6 +9,13 @@ from pathlib import Path
 from .codex import CodexError
 from .config import ConfigError, default_path, init_config, load_config
 from .slack import BridgeError, serve
+
+
+def state_path() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", ""))
+    if not base.is_absolute():
+        base = Path.home() / ".local" / "state"
+    return base / "slack-agent-bridge" / "state.sqlite3"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +34,9 @@ def main(argv: list[str] | None = None) -> int:
             path = args.config.expanduser()
             config = load_config(path)
             logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-            asyncio.run(serve(config, path.with_name("state.sqlite3")))
+            database = state_path()
+            database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            asyncio.run(serve(config, database))
         return 0
     except (ConfigError, CodexError, BridgeError, OSError, sqlite3.Error) as error:
         print(f"slack-agent-bridge: {error}", file=sys.stderr)

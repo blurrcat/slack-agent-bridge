@@ -28,3 +28,31 @@ class InitTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertNotEqual(main(["init"]), 0)
             self.assertEqual(path.read_bytes(), original)
+
+
+class RunTests(unittest.TestCase):
+    def test_state_path_is_independent_of_config_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            config = root / "custom.json"
+            config.write_text(json.dumps({
+                "inbox_channel_id": "CINBOX",
+                "owner_user_id": "UOWNER",
+                "slack_app_token": "xapp-example",
+                "slack_bot_token": "xoxb-example",
+            }))
+            for xdg, base in (
+                ("", root / ".local/state"),
+                ("relative", root / ".local/state"),
+                (str(root / "custom-state"), root / "custom-state"),
+            ):
+                with (
+                    self.subTest(xdg=xdg),
+                    patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": xdg}),
+                    patch("slack_agent_bridge.cli.serve") as serve,
+                ):
+                    self.assertEqual(main(["run", "--config", str(config)]), 0)
+                    assert serve.await_args is not None
+                    expected = base / "slack-agent-bridge/state.sqlite3"
+                    self.assertEqual(serve.await_args.args[1], expected)
+                    self.assertTrue(expected.parent.is_dir())
