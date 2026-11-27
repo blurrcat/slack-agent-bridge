@@ -9,7 +9,7 @@ from pathlib import Path
 from time import time_ns
 from typing import Protocol
 
-from .codex import Codex, CodexError, Turn
+from .codex import Codex, CodexError, CodexSessionMissing, Turn
 from .config import Config
 from .controls import Control, Interaction, control_for_request, result_for_interaction
 
@@ -24,23 +24,24 @@ class Inbox:
         thread = message.thread
         if thread.workspace_id != self.workspace_id or thread.channel_id != self.config.inbox_channel_id:
             return
-        if message.user_id == self.bridge_user_id or (message.bot_id and message.bot_id == self.bridge_bot_id):
+        if self._from_bridge(message):
             return
 
         live = self.sessions.get(thread)
         command = message.text.strip()
+        control = command in {"!esc", "!done", "!end"}
         if message.is_root:
-            if command in {"!esc", "!done", "!end", "!join"} or command.startswith("!join "):
+            if live is not None or (session := self._origin_session(message)) is None:
                 return
-            if live is not None or not (initiator := self._initiator(message)):
-                return
-            session = Session(thread, initiator, initiator_is_bot=bool(message.bot_id))
             if not self.store.claim(session, message.event_id):
                 log.info("Already handled inbox message %s/%s", thread.channel_id, thread.root_ts)
                 return
             live = self.sessions[thread] = LiveSession(session)
-        elif live is None or not self._can_prompt(message, live.session):
-            return
+        else:
+            if live is None:
+                live = await self._session_for_reply(message, allow_replacement=not control)
+            if live is None or not self._can_prompt(message, live.session):
+                return
 
         try:
             async with live.lock:
@@ -65,19 +66,15 @@ class Inbox:
                     return
                 else:
                     closing = False
-                    if live.session.harness_session is None:
-                        if not message.is_root:
+                    if not message.is_root and not self.store.claim_prompt(message):
+                        return
+                    harness = await self._load_harness(live, message.is_root)
+                    if harness is None:
+                        harness = await self._recover_harness(live, message)
+                        if harness is None:
                             return
-                        thread_id = await self.codex.start_thread()
-                        live.session = replace(live.session, harness_session=HarnessSession(thread_id))
-                        self.store.opened(live.session)
-                        await self.slack.started(thread)
-                        log.info("Opened inbox session %s/%s", thread.channel_id, thread.root_ts)
-                    harness = live.session.harness_session
-                    assert harness is not None
-                    thread_id = harness.thread_id
                     submitted_at = Decimal(time_ns()) / 1_000_000_000
-                    turn = await self.codex.submit(thread_id, message.text)
+                    turn = await self.codex.submit(harness.thread_id, message.text)
                     if turn is live.turn:
                         log.info("Steered inbox turn %s for %s/%s", turn.id, thread.channel_id, thread.root_ts)
                         return
@@ -94,7 +91,7 @@ class Inbox:
         except CodexError as error:
             log.warning("Codex could not process inbox message %s: %s", thread.root_ts, error)
             if not live.closed:
-                if command in {"!esc", "!done", "!end"}:
+                if control:
                     await self.slack.reply(thread, str(error))
                 else:
                     await self.slack.reply(thread, "Codex did not confirm a reply. The bridge did not retry the job.")
@@ -137,6 +134,70 @@ class Inbox:
         self.slack = slack
         self.sessions: dict[SlackThread, LiveSession] = {}
         self.controls: dict[str, PendingControl] = {}
+
+    async def _session_for_reply(self, message: SlackMessage, *, allow_replacement: bool) -> LiveSession | None:
+        thread = message.thread
+        if saved := self.store.find(thread):
+            session, closed = saved
+            if closed or not self._can_prompt(message, session):
+                return None
+            live = self.sessions[thread] = LiveSession(session)
+            return live
+        if not allow_replacement or self._initiator(message) is None or message.bot_id is not None:
+            return None
+        origin = await self.slack.origin_message(thread)
+        if origin is None or (verified := self._origin_session(origin)) is None:
+            return None
+        if not self._can_prompt(message, verified):
+            return None
+        # Another reply (or the root event) may have arrived during the Slack lookup.
+        if current := self.sessions.get(thread):
+            return current
+        if not self.store.claim(verified, message.event_id):
+            return None
+        log.info("Verified unmapped inbox origin %s/%s", thread.channel_id, thread.root_ts)
+        live = self.sessions[thread] = LiveSession(verified)
+        return live
+
+    async def _load_harness(self, live: LiveSession, is_origin: bool) -> HarnessSession | None:
+        harness = live.session.harness_session
+        if live.loaded:
+            return harness
+        thread = live.session.slack_thread
+        if is_origin:
+            harness = self._save_harness(live, await self.codex.start_thread())
+            await self.slack.started(thread)
+            log.info("Opened inbox session %s/%s", thread.channel_id, thread.root_ts)
+        elif harness is not None:
+            try:
+                await self.codex.resume_thread(harness.thread_id)
+            except CodexSessionMissing:
+                log.info("Mapped Codex session is missing for %s/%s", thread.channel_id, thread.root_ts)
+                return None
+            live.loaded = True
+            log.info("Resumed inbox session %s/%s", thread.channel_id, thread.root_ts)
+        return harness
+
+    async def _recover_harness(self, live: LiveSession, message: SlackMessage) -> HarnessSession | None:
+        thread = message.thread
+        try:
+            async with asyncio.timeout(30):
+                thread_id = await self.codex.start_thread()
+                await self.codex.recover_slack_context(thread_id, thread.channel_id, thread.root_ts, message.message_ts)
+        except (CodexError, TimeoutError) as error:
+            log.warning("Slack context recovery failed for %s/%s: %s", thread.channel_id, thread.root_ts, error)
+            await self.slack.reply(thread, "Codex could not recover the Slack thread history. Your prompt was not run.")
+            return None
+        log.info("Recovered inbox session %s/%s", thread.channel_id, thread.root_ts)
+        return self._save_harness(live, thread_id)
+
+    def _save_harness(self, live: LiveSession, thread_id: str) -> HarnessSession:
+        harness = HarnessSession(thread_id)
+        session = replace(live.session, harness_session=harness)
+        self.store.opened(session)
+        live.session = session
+        live.loaded = True
+        return harness
 
     async def _forward_turn(self, live: LiveSession, turn: Turn, prompt_ts: str) -> None:
         thread = live.session.slack_thread
@@ -202,6 +263,19 @@ class Inbox:
             raise CodexError("Codex did not confirm the interrupt. You can retry !esc.") from None
         log.info("Interrupted inbox turn %s", turn.id)
 
+    def _from_bridge(self, message: SlackMessage) -> bool:
+        return message.user_id == self.bridge_user_id or (
+            message.bot_id is not None and message.bot_id == self.bridge_bot_id
+        )
+
+    def _origin_session(self, message: SlackMessage) -> Session | None:
+        command = message.text.strip()
+        if command in {"!esc", "!done", "!end", "!join"} or command.startswith("!join "):
+            return None
+        if self._from_bridge(message) or (initiator := self._initiator(message)) is None:
+            return None
+        return Session(message.thread, initiator, initiator_is_bot=message.bot_id is not None)
+
     def _initiator(self, message: SlackMessage) -> str | None:
         if message.bot_id is not None:
             return message.bot_id if message.bot_id in self.config.allowed_bot_ids else None
@@ -262,6 +336,7 @@ class LiveSession:
     turn: Turn | None = None
     turn_started_at: Decimal = Decimal(0)
     closed: bool = False
+    loaded: bool = False
 
     @property
     def running_turn(self) -> Turn | None:
@@ -300,6 +375,13 @@ class SessionStore:
                     UNIQUE (workspace_id, origin_event_id)
                 )
             """)
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS accepted_prompts (
+                    workspace_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, event_id)
+                )
+            """)
         except sqlite3.Error:
             self._db.close()
             raise
@@ -317,6 +399,24 @@ class SessionStore:
                     workspace_id, channel_id, root_ts, origin_event_id, initiator_id, initiator_is_bot
                 ) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
             """, (*session.slack_thread.key, event_id, session.initiator_id, session.initiator_is_bot))
+            return cursor.rowcount == 1
+
+    def find(self, thread: SlackThread) -> tuple[Session, bool] | None:
+        row = self._db.execute("""
+            SELECT initiator_id, initiator_is_bot, harness_thread_id, state
+            FROM sessions WHERE workspace_id = ? AND channel_id = ? AND root_ts = ?
+        """, thread.key).fetchone()
+        if row is None:
+            return None
+        initiator, is_bot, thread_id, state = row
+        harness = HarnessSession(thread_id) if thread_id is not None else None
+        return Session(thread, initiator, bool(is_bot), harness), state == "closed"
+
+    def claim_prompt(self, message: SlackMessage) -> bool:
+        with self._db:
+            cursor = self._db.execute("""
+                INSERT INTO accepted_prompts VALUES (?, ?) ON CONFLICT DO NOTHING
+            """, (message.thread.workspace_id, message.event_id))
             return cursor.rowcount == 1
 
     def opened(self, session: Session) -> None:
@@ -346,6 +446,7 @@ async def confirm_stopped(turn: Turn) -> bool:
 
 
 class SlackReplies(Protocol):
+    async def origin_message(self, thread: SlackThread) -> SlackMessage | None: ...
     async def started(self, thread: SlackThread) -> None: ...
     async def closed(self, thread: SlackThread) -> None: ...
     async def working(self, thread: SlackThread, message_ts: str, active: bool) -> None: ...

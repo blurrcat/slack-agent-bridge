@@ -4,7 +4,10 @@ import itertools
 import json
 import sys
 
-threads = itertools.count(1)
+restart = sys.argv[1] if len(sys.argv) > 1 else None
+threads = itertools.count(2 if restart else 1)
+loaded = set()
+recovered = set()
 turns = itertools.count(1)
 active = {}
 pending = {}
@@ -42,9 +45,54 @@ for line in sys.stdin:
     if method == "initialize":
         result = {}
     elif method == "thread/start":
-        result = {"thread": {"id": f"codex-{next(threads)}"}}
+        thread = f"codex-{next(threads)}"
+        loaded.add(thread)
+        result = {"thread": {"id": thread}}
+    elif method == "thread/resume":
+        thread = params["threadId"]
+        if restart == "crash":
+            sys.exit(1)
+        if restart != "resume" or thread != "codex-1":
+            send({"id": message["id"], "error": {
+                "code": -32600, "message": f"no rollout found for thread id {thread}",
+            }})
+            continue
+        loaded.add(thread)
+        result = {"thread": {"id": thread}}
+    elif method == "mcpServer/tool/call":
+        assert params["server"] == "slack" and params["tool"] == "slack_read_thread"
+        args = params["arguments"]
+        assert (args["channel_id"], args["message_ts"], args["latest"]) == ("CINBOX", "1.000000", "3.000000")
+        if restart == "history-failure":
+            result = {"isError": True, "content": [{"type": "text", "text": "access denied"}]}
+        elif restart == "empty-history":
+            result = {"content": []}
+        elif restart == "malformed-history":
+            result = {"content": [{"type": "text", "text": "Could not read this thread."}]}
+        elif restart == "wrong-root":
+            result = {"structuredContent": {"messages": [{"ts": "0.999999", "text": "unrelated thread"}]}}
+        elif restart == "incomplete-history":
+            result = {"structuredContent": {
+                "messages": [{"ts": "1.000000", "text": "historical origin"}], "has_more": True,
+            }}
+        elif args.get("cursor") == "page-2":
+            result = {"structuredContent": {"messages": [{"ts": "2.000000", "text": "history page 2"}]}}
+        else:
+            result = {"content": [{"type": "text", "text": json.dumps({
+                "messages": [{"ts": "1.000000", "text": "historical origin"}],
+                "response_metadata": {"next_cursor": "page-2"},
+            })}]}
+    elif method == "thread/inject_items":
+        context = params["items"][0]["content"][0]["text"]
+        if restart == "missing":
+            assert "historical origin" in context and "history page 2" in context
+        recovered.add(params["threadId"])
+        result = {}
     elif method == "turn/start":
         thread = params["threadId"]
+        assert thread in loaded
+        if restart == "missing":
+            assert thread in recovered
         prompt = params["input"][0]["text"]
         finishing = None
         if (existing := active.pop(thread, None)) is not None:

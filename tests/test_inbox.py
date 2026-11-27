@@ -98,25 +98,93 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                 unfurl_links=False, unfurl_media=False,
             )
 
-    async def test_authorized_followup_uses_the_existing_codex_thread(self):
+    async def test_authorized_followup_resumes_the_existing_codex_thread_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST"}))
             web = AsyncMock()
+            database = Path(tmp) / "state.sqlite3"
             command = (sys.executable, str(Path(__file__).with_name("fake_codex.py").resolve()))
-            with SessionStore(Path(tmp) / "state.sqlite3") as store:
+            origin = slack_message("1.000000", "hello", user="UGUEST")
+            with SessionStore(database) as store:
                 async with Codex(command) as codex:
                     inbox = Inbox(config, "TWORKSPACE", "UBRIDGE", codex, store, SlackOutput(web))
-                    await inbox.handle(slack_message("1.000000", "hello", user="UGUEST"))
+                    await inbox.handle(origin)
+            with SessionStore(database) as store:
+                async with Codex((*command, "resume")) as codex:
+                    inbox = Inbox(config, "TWORKSPACE", "UBRIDGE", codex, store, SlackOutput(web))
+                    await inbox.handle(origin)  # Slack may deliver the same event twice.
                     await inbox.handle(slack_message("2.000000", "not allowed", root="1.000000", user="UOTHER"))
                     await inbox.handle(slack_message("3.000000", "again", root="1.000000", user="UGUEST"))
-            replies = [
-                call.kwargs["text"] for call in web.chat_postMessage.await_args_list
-                if call.kwargs.get("thread_ts") == "1.000000"
-            ]
-            self.assertIn("codex-1: again", replies)
-            self.assertNotIn("codex-1: not allowed", replies)
-            self.assertEqual(sum(x.kwargs["name"] == "eyes" for x in web.reactions_add.await_args_list), 1)
+            replies = [(c.kwargs["thread_ts"], c.kwargs["text"]) for c in web.chat_postMessage.await_args_list]
+            self.assertEqual(replies, [("1.000000", "codex-1: hello"), ("1.000000", "codex-1: again")])
+            web.conversations_history.assert_not_awaited()
 
+
+    async def test_confirmed_missing_session_recovers_history_before_submitting_the_new_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
+            web = AsyncMock()
+            await deliver(database, config, web, slack_message("1.000000", "original job"))
+            await deliver(database, config, web, slack_message("3.000000", "new prompt", root="1.000000"), mode="missing")
+            replies = [(c.kwargs["thread_ts"], c.kwargs["text"]) for c in web.chat_postMessage.await_args_list]
+            self.assertEqual(replies, [("1.000000", "codex-1: original job"), ("1.000000", "codex-2: new prompt")])
+            web.conversations_history.assert_not_awaited()
+
+    async def test_history_failure_is_reported_without_submitting_the_prompt(self):
+        for mode in ("history-failure", "empty-history", "malformed-history", "wrong-root", "incomplete-history"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                database = Path(tmp) / "state.sqlite3"
+                config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
+                web = AsyncMock()
+                await deliver(database, config, web, slack_message("1.000000", "original"))
+                await deliver(database, config, web, slack_message("3.000000", "do not run", root="1.000000"), mode=mode)
+                replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
+                self.assertEqual(replies, [
+                    "codex-1: original", "Codex could not recover the Slack thread history. Your prompt was not run.",
+                ])
+
+    async def test_unmapped_reply_requires_the_exact_root_and_its_author(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST", "UOTHER"}))
+            web = AsyncMock()
+            origin = {"type": "message", "ts": "1.000000", "user": "UGUEST", "text": "old prompt"}
+            web.conversations_history.side_effect = [
+                {"messages": [{**origin, "ts": "0.999999"}]},
+                {"messages": [{**origin, "user": "UNAUTHORIZED"}]},
+                {"messages": [origin]},
+                {"messages": [origin]},
+            ]
+            await deliver(
+                database, config, web,
+                slack_message("1.100000", "not the actual root", root="1.000000"),
+                slack_message("1.200000", "root author not allowed", root="1.000000"),
+                slack_message("2.000000", "not my session", root="1.000000", user="UOTHER"),
+                slack_message("3.000000", "recover my session", root="1.000000", user="UGUEST"),
+                mode="missing",
+            )
+            web.chat_postMessage.assert_awaited_once_with(
+                channel="CINBOX", thread_ts="1.000000", text="codex-2: recover my session",
+                unfurl_links=False, unfurl_media=False,
+            )
+            self.assertEqual(web.conversations_history.await_args_list, [
+                call(channel="CINBOX", latest="1.000000", inclusive=True, limit=1),
+            ] * 4)
+
+    async def test_resume_crash_does_not_replace_the_session_or_replay_the_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "state.sqlite3"
+            config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
+            web = AsyncMock()
+            await deliver(database, config, web, slack_message("1.000000", "original"))
+            uncertain = slack_message("2.000000", "uncertain", root="1.000000")
+            await deliver(database, config, web, uncertain, mode="crash")
+            await deliver(database, config, web, uncertain, slack_message("3.000000", "new", root="1.000000"), mode="resume")
+            replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
+            self.assertEqual(replies, [
+                "codex-1: original", "Codex did not confirm a reply. The bridge did not retry the job.", "codex-1: new",
+            ])
 
     async def test_busy_followup_steers_interrupt_leaves_open_and_close_stays_closed(self):
         # A follow-up can be posted before its turn actually begins.
@@ -307,6 +375,17 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(replies.count("codex-1: next"), 1)
             self.assertFalse(any(line.startswith(("Command ", "File change ", "MCP tool ", "Tool ", "Web search "))
                                  for line in replies))
+
+
+async def deliver(database, config, web, *messages, mode=None):
+    command = (sys.executable, str(Path(__file__).with_name("fake_codex.py").resolve()))
+    if mode is not None:
+        command += (mode,)
+    with SessionStore(database) as store:
+        async with Codex(command) as codex:
+            inbox = Inbox(config, "TWORKSPACE", "UBRIDGE", codex, store, SlackOutput(web))
+            for message in messages:
+                await inbox.handle(message)
 
 
 def slack_message(ts, text, *, root=None, user="UOWNER"):
