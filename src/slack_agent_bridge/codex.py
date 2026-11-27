@@ -16,6 +16,34 @@ class CodexError(RuntimeError):
 class Codex:
     """One app-server connection; requests and notifications can interleave."""
 
+    async def start_thread(self) -> str:
+        result = await self._request("thread/start", {})
+        return result["thread"]["id"]
+
+    async def first_reply(self, thread_id: str, prompt: str) -> str:
+        messages: asyncio.Queue = asyncio.Queue()
+        self._turns[thread_id] = messages
+        try:
+            result = await self._request("turn/start", {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            })
+            turn_id = result["turn"]["id"]
+            answer = ""
+            while True:
+                event = await messages.get()
+                if event is None:
+                    raise CodexError("Codex disconnected before finishing the turn.")
+                method, params = event
+                if method == "item/completed" and params["turnId"] == turn_id:
+                    answer = params["item"]["text"]
+                if method == "turn/completed" and params["turn"]["id"] == turn_id:
+                    if params["turn"]["status"] != "completed" or not answer.strip():
+                        raise CodexError("Codex did not complete a text reply.")
+                    return answer
+        finally:
+            self._turns.pop(thread_id, None)
+
     def __init__(self, command: tuple[str, ...], cwd: Path | None = None, *, secrets: tuple[str, ...] = ()):
         self.command = command
         self.cwd = cwd
@@ -63,20 +91,6 @@ class Codex:
             self._reader.cancel()
             self._stderr.cancel()
             await asyncio.gather(self._reader, self._stderr, return_exceptions=True)
-
-    async def _drain_stderr(self) -> None:
-        assert self._process.stderr is not None
-        while await self._process.stderr.read(65536):
-            # Keep the pipe flowing without logging host or tool data.
-            pass
-
-    async def _send(self, message: dict) -> None:
-        assert self._process.stdin is not None
-        try:
-            self._process.stdin.write(json.dumps(message).encode() + b"\n")
-            await self._process.stdin.drain()
-        except OSError:
-            raise CodexError("Codex stdin closed.") from None
 
     async def _request(self, method: str, params: dict) -> dict:
         if self.closed.is_set():
@@ -128,30 +142,16 @@ class Codex:
             for queue in self._turns.values():
                 queue.put_nowait(None)
 
-    async def start_thread(self) -> str:
-        result = await self._request("thread/start", {})
-        return result["thread"]["id"]
-
-    async def first_reply(self, thread_id: str, prompt: str) -> str:
-        messages: asyncio.Queue = asyncio.Queue()
-        self._turns[thread_id] = messages
+    async def _send(self, message: dict) -> None:
+        assert self._process.stdin is not None
         try:
-            result = await self._request("turn/start", {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
-            })
-            turn_id = result["turn"]["id"]
-            answer = ""
-            while True:
-                event = await messages.get()
-                if event is None:
-                    raise CodexError("Codex disconnected before finishing the turn.")
-                method, params = event
-                if method == "item/completed" and params["turnId"] == turn_id:
-                    answer = params["item"]["text"]
-                if method == "turn/completed" and params["turn"]["id"] == turn_id:
-                    if params["turn"]["status"] != "completed" or not answer.strip():
-                        raise CodexError("Codex did not complete a text reply.")
-                    return answer
-        finally:
-            self._turns.pop(thread_id, None)
+            self._process.stdin.write(json.dumps(message).encode() + b"\n")
+            await self._process.stdin.drain()
+        except OSError:
+            raise CodexError("Codex stdin closed.") from None
+
+    async def _drain_stderr(self) -> None:
+        assert self._process.stderr is not None
+        while await self._process.stderr.read(65536):
+            # Keep the pipe flowing without logging host or tool data.
+            pass

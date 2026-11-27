@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import sqlite3
 from dataclasses import dataclass, replace
@@ -9,6 +11,60 @@ from .config import Config
 
 
 log = logging.getLogger(__name__)
+
+
+class Inbox:
+
+    async def handle(self, origin: OriginMessage | None) -> None:
+        if origin is None:
+            return
+        thread = origin.thread
+        if thread.workspace_id != self.workspace_id or thread.channel_id != self.config.inbox_channel_id:
+            return
+        if origin.user_id == self.bridge_user_id or (origin.bot_id and origin.bot_id == self.bridge_bot_id):
+            return
+        if origin.bot_id:
+            if origin.bot_id not in self.config.allowed_bot_ids:
+                return
+            initiator = origin.bot_id
+        else:
+            if not origin.user_id or (
+                origin.user_id != self.config.owner_user_id and origin.user_id not in self.config.allowed_user_ids
+            ):
+                return
+            initiator = origin.user_id
+
+        session = Session(thread, initiator, initiator_is_bot=bool(origin.bot_id))
+        if not self.store.claim(session, origin.event_id):
+            log.info("Already handled inbox message %s/%s", thread.channel_id, thread.root_ts)
+            return
+
+        log.info("Accepted inbox message %s/%s", thread.channel_id, thread.root_ts)
+        try:
+            codex_thread = await self.codex.start_thread()
+            session = replace(session, harness_session=HarnessSession(codex_thread))
+            self.store.opened(session)
+            await self.slack.started(thread)
+            answer = await self.codex.first_reply(codex_thread, origin.text)
+        except CodexError as error:
+            log.warning("Codex did not complete inbox message %s: %s", thread.root_ts, error)
+            await self.slack.reply(thread, "Codex did not confirm a reply. The bridge did not retry the job.")
+            return
+
+        await self.slack.reply(thread, answer)
+        log.info("Posted the first reply for %s/%s", thread.channel_id, thread.root_ts)
+
+    def __init__(
+        self, config: Config, workspace_id: str, bridge_user_id: str, codex: Codex,
+        store: SessionStore, slack: SlackReplies, bridge_bot_id: str | None = None,
+    ):
+        self.config = config
+        self.workspace_id = workspace_id
+        self.bridge_user_id = bridge_user_id
+        self.bridge_bot_id = bridge_bot_id
+        self.codex = codex
+        self.store = store
+        self.slack = slack
 
 
 @dataclass(frozen=True)
@@ -97,56 +153,3 @@ class SessionStore:
 class SlackReplies(Protocol):
     async def started(self, thread: SlackThread) -> None: ...
     async def reply(self, thread: SlackThread, text: str) -> None: ...
-
-
-class Inbox:
-    def __init__(
-        self, config: Config, workspace_id: str, bridge_user_id: str, codex: Codex,
-        store: SessionStore, slack: SlackReplies, bridge_bot_id: str | None = None,
-    ):
-        self.config = config
-        self.workspace_id = workspace_id
-        self.bridge_user_id = bridge_user_id
-        self.bridge_bot_id = bridge_bot_id
-        self.codex = codex
-        self.store = store
-        self.slack = slack
-
-    async def handle(self, origin: OriginMessage | None) -> None:
-        if origin is None:
-            return
-        thread = origin.thread
-        if thread.workspace_id != self.workspace_id or thread.channel_id != self.config.inbox_channel_id:
-            return
-        if origin.user_id == self.bridge_user_id or (origin.bot_id and origin.bot_id == self.bridge_bot_id):
-            return
-        if origin.bot_id:
-            if origin.bot_id not in self.config.allowed_bot_ids:
-                return
-            initiator = origin.bot_id
-        else:
-            if not origin.user_id or (
-                origin.user_id != self.config.owner_user_id and origin.user_id not in self.config.allowed_user_ids
-            ):
-                return
-            initiator = origin.user_id
-
-        session = Session(thread, initiator, initiator_is_bot=bool(origin.bot_id))
-        if not self.store.claim(session, origin.event_id):
-            log.info("Already handled inbox message %s/%s", thread.channel_id, thread.root_ts)
-            return
-
-        log.info("Accepted inbox message %s/%s", thread.channel_id, thread.root_ts)
-        try:
-            codex_thread = await self.codex.start_thread()
-            session = replace(session, harness_session=HarnessSession(codex_thread))
-            self.store.opened(session)
-            await self.slack.started(thread)
-            answer = await self.codex.first_reply(codex_thread, origin.text)
-        except CodexError as error:
-            log.warning("Codex did not complete inbox message %s: %s", thread.root_ts, error)
-            await self.slack.reply(thread, "Codex did not confirm a reply. The bridge did not retry the job.")
-            return
-
-        await self.slack.reply(thread, answer)
-        log.info("Posted the first reply for %s/%s", thread.channel_id, thread.root_ts)

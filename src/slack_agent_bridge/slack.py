@@ -20,6 +20,45 @@ class BridgeError(RuntimeError):
     pass
 
 
+async def serve(config: Config, database: Path) -> None:
+    web = AsyncWebClient(token=config.slack_bot_token)
+    try:
+        auth = await web.auth_test()
+    except SlackApiError:
+        raise BridgeError("Slack bot authentication failed. Check the bot token.") from None
+
+    with SessionStore(database) as store:
+        async with Codex(config.codex_command, config.codex_cwd, secrets=(
+            config.slack_app_token, config.slack_bot_token,
+        )) as codex:
+            inbox = Inbox(config, auth["team_id"], auth["user_id"], codex, store, SlackOutput(web), auth.get("bot_id"))
+            async with asyncio.TaskGroup() as jobs:
+                async def handle(origin: OriginMessage) -> None:
+                    try:
+                        await inbox.handle(origin)
+                    except Exception as error:
+                        log.error("Could not process inbox message %s (%s).", origin.thread.root_ts, type(error).__name__)
+
+                async def on_request(client, request):
+                    if request.envelope_id:
+                        await client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+                    if request.type == "events_api" and (origin := message_from_event(request.payload)):
+                        jobs.create_task(handle(origin))
+
+                socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
+                try:
+                    socket.socket_mode_request_listeners.append(on_request)
+                    try:
+                        await socket.connect()
+                    except SlackApiError:
+                        raise BridgeError("Could not connect to Slack Socket Mode. Check the app token and settings.") from None
+                    log.info("Listening in %s. The bot must be invited to the private inbox.", config.inbox_channel_id)
+                    await codex.closed.wait()
+                finally:
+                    await socket.close()
+            raise BridgeError("Codex app-server disconnected.")
+
+
 def message_from_event(payload: dict) -> OriginMessage | None:
     event = payload.get("event", {})
     if not isinstance(event, dict) or event.get("type") != "message" or event.get("thread_ts"):
@@ -66,42 +105,3 @@ class SlackOutput:
             channel=thread.channel_id, thread_ts=thread.root_ts, text=text,
             unfurl_links=False, unfurl_media=False,
         )
-
-
-async def serve(config: Config, database: Path) -> None:
-    web = AsyncWebClient(token=config.slack_bot_token)
-    try:
-        auth = await web.auth_test()
-    except SlackApiError:
-        raise BridgeError("Slack bot authentication failed. Check the bot token.") from None
-
-    with SessionStore(database) as store:
-        async with Codex(config.codex_command, config.codex_cwd, secrets=(
-            config.slack_app_token, config.slack_bot_token,
-        )) as codex:
-            inbox = Inbox(config, auth["team_id"], auth["user_id"], codex, store, SlackOutput(web), auth.get("bot_id"))
-            async with asyncio.TaskGroup() as jobs:
-                async def handle(origin: OriginMessage) -> None:
-                    try:
-                        await inbox.handle(origin)
-                    except Exception as error:
-                        log.error("Could not process inbox message %s (%s).", origin.thread.root_ts, type(error).__name__)
-
-                async def on_request(client, request):
-                    if request.envelope_id:
-                        await client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
-                    if request.type == "events_api" and (origin := message_from_event(request.payload)):
-                        jobs.create_task(handle(origin))
-
-                socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
-                try:
-                    socket.socket_mode_request_listeners.append(on_request)
-                    try:
-                        await socket.connect()
-                    except SlackApiError:
-                        raise BridgeError("Could not connect to Slack Socket Mode. Check the app token and settings.") from None
-                    log.info("Listening in %s. The bot must be invited to the private inbox.", config.inbox_channel_id)
-                    await codex.closed.wait()
-                finally:
-                    await socket.close()
-            raise BridgeError("Codex app-server disconnected.")

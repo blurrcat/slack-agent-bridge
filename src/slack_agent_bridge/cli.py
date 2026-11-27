@@ -11,13 +11,6 @@ from .config import ConfigError, default_path, init_config, load_config
 from .slack import BridgeError, serve
 
 
-def state_path() -> Path:
-    base = Path(os.environ.get("XDG_STATE_HOME", ""))
-    if not base.is_absolute():
-        base = Path.home() / ".local" / "state"
-    return base / "slack-agent-bridge" / "state.sqlite3"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="slack-agent-bridge")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -43,6 +36,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+
+
+def state_path() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", ""))
+    if not base.is_absolute():
+        base = Path.home() / ".local" / "state"
+    return base / "slack-agent-bridge" / "state.sqlite3"
 
 
 if __name__ == "__main__":
