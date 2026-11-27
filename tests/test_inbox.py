@@ -128,11 +128,11 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             web = AsyncMock()
             reached_tool = asyncio.Event()
 
-            async def watch_output(**kwargs):
-                if kwargs["text"] == "Command completed.":
+            async def watch_working(**kwargs):
+                if kwargs["name"] == "hourglass_flowing_sand":
                     reached_tool.set()
 
-            web.chat_postMessage.side_effect = watch_output
+            web.reactions_add.side_effect = watch_working
             command = (sys.executable, str(Path(__file__).with_name("fake_codex.py").resolve()))
             with SessionStore(Path(tmp) / "state.sqlite3") as store:
                 async with Codex(command) as codex, asyncio.TaskGroup() as jobs:
@@ -165,6 +165,8 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("codex-1: must not run", output)
             self.assertEqual(output.count("Bye."), 1)
             self.assertFalse(any("DO NOT EXPOSE" in line for line in output))
+            self.assertFalse(any(line.startswith(("Command ", "File change ", "MCP tool ", "Tool ", "Web search "))
+                                 for line in output))
             self.assertIn(call(channel="CINBOX", timestamp="1.000000", name="white_check_mark"),
                           web.reactions_add.await_args_list)
 
@@ -287,11 +289,11 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             web = AsyncMock()
             reached_tool = asyncio.Event()
 
-            async def post(**kwargs):
-                if kwargs["text"] == "Command completed.":
+            async def watch_working(**kwargs):
+                if kwargs["name"] == "hourglass_flowing_sand":
                     reached_tool.set()
 
-            web.chat_postMessage.side_effect = post
+            web.reactions_add.side_effect = watch_working
             command = (sys.executable, str(Path(__file__).with_name("fake_codex.py").resolve()))
             with SessionStore(Path(tmp) / "state.sqlite3") as store:
                 async with Codex(command) as codex, asyncio.TaskGroup() as jobs:
@@ -303,6 +305,8 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
             self.assertIn("finished before follow-up", replies)
             self.assertEqual(replies.count("codex-1: next"), 1)
+            self.assertFalse(any(line.startswith(("Command ", "File change ", "MCP tool ", "Tool ", "Web search "))
+                                 for line in replies))
 
 
 def slack_message(ts, text, *, root=None, user="UOWNER"):

@@ -149,8 +149,6 @@ class Inbox:
                     item = params["item"]
                     if item["type"] == "agentMessage":
                         answer = item["text"]
-                    elif summary := tool_summary(item):
-                        await self.slack.reply(thread, summary)
                 elif method == "request" and params["turnId"] == turn.id:
                     await self._present_request(thread, turn, params)
                 elif method == "serverRequest/resolved":
@@ -345,19 +343,6 @@ async def confirm_stopped(turn: Turn) -> bool:
     except TimeoutError:
         return False
     return True
-
-
-def tool_summary(item: dict) -> str | None:
-    labels = {
-        "commandExecution": "Command", "fileChange": "File change", "mcpToolCall": "MCP tool",
-        "dynamicToolCall": "Tool", "webSearch": "Web search",
-    }
-    if label := labels.get(item["type"]):
-        status = item.get("status")
-        outcome = {"completed": "completed", "failed": "failed", "declined": "declined",
-                   "interrupted": "interrupted"}.get(status, "finished")
-        return f"{label} {outcome}."
-    return None
 
 
 class SlackReplies(Protocol):
