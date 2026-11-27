@@ -71,12 +71,20 @@ def result_for_interaction(control: Control, interaction: Interaction) -> dict |
             answers[question.id] = {"answers": [answer]}
         return {"answers": answers}
 
-    if interaction.action not in {"approve", "decline"}:
+    decision = {
+        "approve": "accept",
+        "approve_session": "acceptForSession",
+        "decline": "decline",
+    }.get(interaction.action)
+    if decision is None:
         return None
-    approve = interaction.action == "approve"
     if control.kind == "permissions":
-        return {"permissions": control.permissions if approve else {}, "scope": "turn"}
-    return {"decision": "accept" if approve else "decline"}
+        return {
+            "permissions": {} if decision == "decline" else control.permissions,
+            "scope": "session" if decision == "acceptForSession" else "turn",
+        }
+    return {"decision": decision}
+
 
 @dataclass(frozen=True)
 class Control:

@@ -115,7 +115,12 @@ def interaction_from_payload(payload: dict) -> Interaction | None:
         if len(actions) != 1:
             return None
         action = actions[0]
-        name = {"sb_approve": "approve", "sb_decline": "decline", "sb_answer": "answer"}.get(action.get("action_id"))
+        name = {
+            "sb_approve": "approve",
+            "sb_approve_session": "approve_session",
+            "sb_decline": "decline",
+            "sb_answer": "answer",
+        }.get(action.get("action_id"))
         token = action.get("value")
         if name and isinstance(token, str):
             container = payload.get("container") or {}
@@ -161,7 +166,11 @@ class SlackOutput:
         buttons = (
             [button("Answer", "answer")]
             if control.kind == "input"
-            else [button("Approve once", "approve", "primary"), button("Decline", "decline")]
+            else [
+                button("Approve once", "approve", "primary"),
+                button("Approve for session", "approve_session"),
+                button("Decline", "decline"),
+            ]
         )
         try:
             response = await self.web.chat_postMessage(

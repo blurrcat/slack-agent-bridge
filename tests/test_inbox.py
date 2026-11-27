@@ -169,7 +169,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                           web.reactions_add.await_args_list)
 
 
-    async def test_approval_accepts_only_the_owner_and_only_once(self):
+    async def test_approval_requires_the_owner_and_honors_the_chosen_scope(self):
         with tempfile.TemporaryDirectory() as tmp, patch("slack_agent_bridge.inbox.time_ns", return_value=0):
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST"}))
             web = AsyncMock()
@@ -194,23 +194,35 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         await card_ready.wait()
                         approve = next(button for button in buttons if button["text"]["text"] == "Approve once")
 
-                        def click(user, channel="CINBOX"):
+                        def click(user, button=approve, channel="CINBOX"):
                             return interaction_from_payload({
                                 "type": "block_actions", "team": {"id": "TWORKSPACE"},
                                 "user": {"id": user}, "container": {"channel_id": channel, "message_ts": "2.000000"},
-                                "actions": [approve],
+                                "actions": [button],
                             })
 
                         await inbox.interact(click("UGUEST"))
-                        await inbox.interact(click("UOWNER", "OTHER"))
+                        await inbox.interact(click("UOWNER", channel="OTHER"))
                         self.assertFalse(job.done())
                         # A confirmed rejection of !esc must not strand an owner approval.
                         await inbox.handle(slack_message("3.000000", "!esc", root="1.000000"))
                         await inbox.interact(click("UOWNER"))
                         await job
-                        await inbox.interact(click("UOWNER"))
+                        buttons.clear()
+                        card_ready.clear()
+                        followup = jobs.create_task(inbox.handle(slack_message("4.000000", "approve", root="1.000000")))
+                        await card_ready.wait()
+                        approve_session = next(
+                            button for button in buttons if button["text"]["text"] == "Approve for session"
+                        )
+                        await inbox.interact(click("UOWNER"))  # The old button cannot answer this request.
+                        await inbox.interact(click("UGUEST", approve_session))
+                        self.assertFalse(followup.done())
+                        await inbox.interact(click("UOWNER", approve_session))
+                        await followup
             replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
             self.assertEqual(replies.count("decision: accept"), 1)
+            self.assertEqual(replies.count("decision: acceptForSession"), 1)
 
 
     async def test_owner_answers_a_question_through_a_modal(self):
