@@ -3,11 +3,13 @@
 import itertools
 import json
 import sys
+import time
 
 threads = itertools.count(1)
 turns = itertools.count(1)
 active = {}
 pending = {}
+modes = {}
 
 
 def send(message):
@@ -46,8 +48,9 @@ for line in sys.stdin:
         thread = params["threadId"]
         turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
         prompt = params["input"][0]["text"]
-        if prompt in {"hold", "approve", "question"}:
+        if prompt in {"hold", "approve", "question", "finish-before-steer"}:
             active[thread] = turn
+            modes[thread] = prompt
             send({"method": "item/completed", "params": {
                 "threadId": thread, "turnId": turn["id"],
                 "item": {"type": "commandExecution", "status": "completed", "aggregatedOutput": "DO NOT EXPOSE"},
@@ -78,10 +81,18 @@ for line in sys.stdin:
         thread = params["threadId"]
         turn = active.pop(thread)
         assert params["expectedTurnId"] == turn["id"]
+        if modes[thread] == "finish-before-steer":
+            send({"id": message["id"], "error": {"message": "no active turn to steer", "code": -32600}})
+            time.sleep(0.05)
+            completed(thread, turn, "finished before steering")
+            continue
         completed(thread, turn, "steered: " + params["input"][0]["text"])
         result = {"turnId": turn["id"]}
     elif method == "turn/interrupt":
         thread = params["threadId"]
+        if modes[thread] == "approve":
+            send({"id": message["id"], "error": {"message": "interrupt rejected", "code": -32600}})
+            continue
         turn = active.pop(thread)
         assert params["turnId"] == turn["id"]
         completed(thread, turn, status="interrupted")

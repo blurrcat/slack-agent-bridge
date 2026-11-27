@@ -13,8 +13,9 @@ log = logging.getLogger(__name__)
 
 
 class CodexError(RuntimeError):
-    def __init__(self, message: str, *, no_active_turn: bool = False):
+    def __init__(self, message: str, *, rejected: bool = False, no_active_turn: bool = False):
         super().__init__(message)
+        self.rejected = rejected
         self.no_active_turn = no_active_turn
 
 
@@ -49,10 +50,6 @@ class Codex:
 
     async def reject_request(self, request_id: int | str) -> None:
         await self._send({"id": request_id, "error": {"code": -32601, "message": "Request not supported here."}})
-
-    def release_turn(self, turn: Turn) -> None:
-        if self._turns.get(turn.thread_id) is turn:
-            self._turns.pop(turn.thread_id)
 
     def __init__(self, command: tuple[str, ...], cwd: Path | None = None, *, secrets: tuple[str, ...] = ()):
         self.command = command
@@ -118,7 +115,7 @@ class Codex:
             self._pending.pop(request_id, None)
         if "error" in reply:
             reason = str(reply["error"].get("message", "")).strip().lower().rstrip(".")
-            raise CodexError(f"Codex rejected {method}.", no_active_turn=reason in {
+            raise CodexError(f"Codex rejected {method}.", rejected=True, no_active_turn=reason in {
                 "no active turn", "no active turn to steer", "no active turn to interrupt",
             })
         return reply["result"]
@@ -148,6 +145,7 @@ class Codex:
                             if turn.id is not None and params["turn"]["id"] != turn.id:
                                 continue
                             turn.stopped.set()
+                            self._turns.pop(turn.thread_id, None)
                         elif method == "serverRequest/resolved":
                             turn.resolved_requests.add(params["requestId"])
                         turn.events.put_nowait((method, params))

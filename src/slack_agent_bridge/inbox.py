@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
+from time import time_ns
 from typing import Protocol
 
 from .codex import Codex, CodexError, Turn
@@ -59,7 +60,7 @@ class Inbox:
                     closing = True
                 elif command == "!esc":
                     running = live.running_turn
-                    if running is not None and Decimal(message.message_ts) >= Decimal(live.turn_prompt_ts):
+                    if running is not None and Decimal(message.message_ts) >= live.turn_started_at:
                         await self._interrupt(running)
                     return
                 else:
@@ -68,9 +69,10 @@ class Inbox:
                         try:
                             await self.codex.steer(running, message.text)
                         except CodexError as error:
-                            if not (error.no_active_turn and running.stopped.is_set()):
+                            if not error.no_active_turn or not await confirm_stopped(running):
                                 raise
                         else:
+                            log.info("Steered inbox turn %s for %s/%s", running.id, thread.channel_id, thread.root_ts)
                             return
                     if live.session.harness_session is None:
                         if not message.is_root:
@@ -83,8 +85,8 @@ class Inbox:
                     harness = live.session.harness_session
                     assert harness is not None
                     thread_id = harness.thread_id
+                    live.turn_started_at = Decimal(time_ns()) / 1_000_000_000
                     turn = live.turn = await self.codex.start_turn(thread_id, message.text)
-                    live.turn_prompt_ts = message.message_ts
             if closing:
                 if stopping is not None:
                     await stopping.stopped.wait()
@@ -96,7 +98,10 @@ class Inbox:
         except CodexError as error:
             log.warning("Codex could not process inbox message %s: %s", thread.root_ts, error)
             if not live.closed:
-                await self.slack.reply(thread, "Codex did not confirm a reply. The bridge did not retry the job.")
+                if command in {"!esc", "!done", "!end"}:
+                    await self.slack.reply(thread, str(error))
+                else:
+                    await self.slack.reply(thread, "Codex did not confirm a reply. The bridge did not retry the job.")
 
     async def interact(self, interaction: Interaction | None) -> None:
         if interaction is None or interaction.workspace_id != self.workspace_id:
@@ -121,6 +126,7 @@ class Inbox:
             return
         self.controls.pop(interaction.token, None)
         await self.codex.answer_request(pending.control.request_id, result)
+        log.info("Forwarded owner control %s for turn %s", interaction.action, pending.turn.id)
 
     def __init__(
         self, config: Config, workspace_id: str, bridge_user_id: str, codex: Codex,
@@ -167,7 +173,6 @@ class Inbox:
             raise CodexError("Codex disconnected before finishing the turn.")
         finally:
             self._forget_controls(turn)
-            self.codex.release_turn(turn)
             await self.slack.working(thread, prompt_ts, False)
 
     async def _present_request(self, thread: SlackThread, turn: Turn, request: dict) -> None:
@@ -182,6 +187,7 @@ class Inbox:
                 return
             self.controls.pop(control.token, None)
         if not turn.stopped.is_set() and request["request_id"] not in turn.resolved_requests:
+            log.info("Rejecting unavailable Slack control for turn %s", turn.id)
             await self.codex.reject_request(request["request_id"])
 
     def _forget_controls(self, turn: Turn, request_id: int | str | None = None) -> None:
@@ -193,9 +199,14 @@ class Inbox:
         turn.interrupting = True
         try:
             await self.codex.interrupt(turn)
-        except CodexError:
-            if not turn.stopped.is_set():
+        except CodexError as error:
+            if turn.stopped.is_set() or (error.no_active_turn and await confirm_stopped(turn)):
+                return
+            if error.rejected:
+                turn.interrupting = False
                 raise
+            raise CodexError("Codex did not confirm the interrupt. You can retry !esc.") from None
+        log.info("Interrupted inbox turn %s", turn.id)
 
     def _initiator(self, message: SlackMessage) -> str | None:
         if message.bot_id is not None:
@@ -255,7 +266,7 @@ class LiveSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     seen: set[str] = field(default_factory=set)
     turn: Turn | None = None
-    turn_prompt_ts: str = "0"
+    turn_started_at: Decimal = Decimal(0)
     closed: bool = False
 
     @property
@@ -329,6 +340,15 @@ class SessionStore:
                 UPDATE sessions SET state = 'closed'
                 WHERE workspace_id = ? AND channel_id = ? AND root_ts = ?
             """, thread.key)
+
+
+async def confirm_stopped(turn: Turn) -> bool:
+    # An explicit no-active-turn response can precede its terminal notification.
+    try:
+        await asyncio.wait_for(turn.stopped.wait(), timeout=2)
+    except TimeoutError:
+        return False
+    return True
 
 
 def tool_summary(item: dict) -> str | None:

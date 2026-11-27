@@ -184,7 +184,7 @@ class SlackOutput:
         for index, question in enumerate(control.questions):
             text = question.text
             element = {"type": "plain_text_input", "action_id": "answer", "max_length": 1000}
-            if question.options and not question.allow_other:
+            if question.requires_choice:
                 element = {
                     "type": "static_select", "action_id": "answer",
                     "options": [{"text": plain(label), "value": label} for label in question.options],

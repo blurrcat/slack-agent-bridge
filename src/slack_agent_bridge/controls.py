@@ -25,7 +25,7 @@ def control_for_request(request: dict) -> Control | None:
             for q in questions
         ):
             return None
-        if any(q.options and not q.allow_other and any(not 0 < len(o) <= 75 for o in q.options) for q in questions):
+        if any(q.requires_choice and any(not 0 < len(o) <= 75 for o in q.options) for q in questions):
             return None
         return Control(request_id, "input", "Codex needs your input.", questions)
 
@@ -66,7 +66,7 @@ def result_for_interaction(control: Control, interaction: Interaction) -> dict |
             answer = selected.get("value") or (selected.get("selected_option") or {}).get("value")
             if not isinstance(answer, str) or not answer.strip():
                 return None
-            if question.options and not question.allow_other and answer not in question.options:
+            if question.requires_choice and answer not in question.options:
                 return None
             answers[question.id] = {"answers": [answer]}
         return {"answers": answers}
@@ -98,6 +98,10 @@ class Question:
     options: tuple[str, ...]
     allow_other: bool
 
+    @property
+    def requires_choice(self) -> bool:
+        return bool(self.options) and not self.allow_other
+
 
 @dataclass(frozen=True)
 class Interaction:
@@ -109,4 +113,3 @@ class Interaction:
     message_ts: str | None = None
     trigger_id: str | None = None
     values: dict = field(default_factory=dict, repr=False)
-

@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, patch
 
 from slack_agent_bridge.codex import Codex
 from slack_agent_bridge.config import Config
@@ -119,7 +119,11 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_busy_followup_steers_interrupt_leaves_open_and_close_stays_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # A follow-up can be posted before its turn actually begins.
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "slack_agent_bridge.inbox.time_ns",
+            side_effect=[1_000_000_000, 4_500_000_000, 6_000_000_000, 7_000_000_000],
+        ):
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST"}))
             web = AsyncMock()
             reached_tool = asyncio.Event()
@@ -143,7 +147,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         second = jobs.create_task(inbox.handle(slack_message("4.000000", "hold", root="1.000000")))
                         await reached_tool.wait()
                         # A delayed interrupt posted before this turn cannot stop it.
-                        await inbox.handle(slack_message("3.500000", "!esc", root="1.000000"))
+                        await inbox.handle(slack_message("4.250000", "!esc", root="1.000000"))
                         self.assertFalse(second.done())
                         await inbox.handle(slack_message("5.000000", "!esc", root="1.000000"))
                         await second
@@ -166,7 +170,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_approval_accepts_only_the_owner_and_only_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch("slack_agent_bridge.inbox.time_ns", return_value=0):
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test", allowed_user_ids=frozenset({"UGUEST"}))
             web = AsyncMock()
             card_ready = asyncio.Event()
@@ -200,6 +204,8 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         await inbox.interact(click("UGUEST"))
                         await inbox.interact(click("UOWNER", "OTHER"))
                         self.assertFalse(job.done())
+                        # A confirmed rejection of !esc must not strand an owner approval.
+                        await inbox.handle(slack_message("3.000000", "!esc", root="1.000000"))
                         await inbox.interact(click("UOWNER"))
                         await job
                         await inbox.interact(click("UOWNER"))
@@ -255,6 +261,30 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
                         await inbox.interact(submit("UOWNER", "Python"))
                         await job
             self.assertIn("decision: Python", [c.kwargs["text"] for c in web.chat_postMessage.await_args_list])
+
+
+    async def test_rejected_steer_waits_for_the_terminal_event_before_starting_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
+            web = AsyncMock()
+            reached_tool = asyncio.Event()
+
+            async def post(**kwargs):
+                if kwargs["text"] == "Command completed.":
+                    reached_tool.set()
+
+            web.chat_postMessage.side_effect = post
+            command = (sys.executable, str(Path(__file__).with_name("fake_codex.py").resolve()))
+            with SessionStore(Path(tmp) / "state.sqlite3") as store:
+                async with Codex(command) as codex, asyncio.TaskGroup() as jobs:
+                    inbox = Inbox(config, "TWORKSPACE", "UBRIDGE", codex, store, SlackOutput(web))
+                    jobs.create_task(inbox.handle(slack_message("1.000000", "finish-before-steer")))
+                    async with asyncio.timeout(3):
+                        await reached_tool.wait()
+                        await inbox.handle(slack_message("2.000000", "next", root="1.000000"))
+            replies = [c.kwargs["text"] for c in web.chat_postMessage.await_args_list]
+            self.assertIn("finished before steering", replies)
+            self.assertEqual(replies.count("codex-1: next"), 1)
 
 
 def slack_message(ts, text, *, root=None, user="UOWNER"):
