@@ -120,7 +120,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             web.conversations_history.assert_not_awaited()
 
 
-    async def test_confirmed_missing_session_recovers_history_before_submitting_the_new_prompt(self):
+    async def test_confirmed_missing_session_primes_the_agent_before_submitting_the_new_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "state.sqlite3"
             config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")
@@ -132,7 +132,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             web.conversations_history.assert_not_awaited()
 
     async def test_history_failure_is_reported_without_submitting_the_prompt(self):
-        for mode in ("history-failure", "empty-history", "malformed-history", "wrong-root", "incomplete-history"):
+        for mode in ("history-failure", "incomplete-history"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 database = Path(tmp) / "state.sqlite3"
                 config = Config("CINBOX", "UOWNER", "xapp-test", "xoxb-test")

@@ -59,41 +59,28 @@ for line in sys.stdin:
             continue
         loaded.add(thread)
         result = {"thread": {"id": thread}}
-    elif method == "mcpServer/tool/call":
-        assert params["server"] == "slack" and params["tool"] == "slack_read_thread"
-        args = params["arguments"]
-        assert (args["channel_id"], args["message_ts"], args["latest"]) == ("CINBOX", "1.000000", "3.000000")
-        if restart == "history-failure":
-            result = {"isError": True, "content": [{"type": "text", "text": "access denied"}]}
-        elif restart == "empty-history":
-            result = {"content": []}
-        elif restart == "malformed-history":
-            result = {"content": [{"type": "text", "text": "Could not read this thread."}]}
-        elif restart == "wrong-root":
-            result = {"structuredContent": {"messages": [{"ts": "0.999999", "text": "unrelated thread"}]}}
-        elif restart == "incomplete-history":
-            result = {"structuredContent": {
-                "messages": [{"ts": "1.000000", "text": "historical origin"}], "has_more": True,
-            }}
-        elif args.get("cursor") == "page-2":
-            result = {"structuredContent": {"messages": [{"ts": "2.000000", "text": "history page 2"}]}}
-        else:
-            result = {"content": [{"type": "text", "text": json.dumps({
-                "messages": [{"ts": "1.000000", "text": "historical origin"}],
-                "response_metadata": {"next_cursor": "page-2"},
-            })}]}
-    elif method == "thread/inject_items":
-        context = params["items"][0]["content"][0]["text"]
-        if restart == "missing":
-            assert "historical origin" in context and "history page 2" in context
-        recovered.add(params["threadId"])
-        result = {}
     elif method == "turn/start":
         thread = params["threadId"]
         assert thread in loaded
+        prompt = params["input"][0]["text"]
+        if prompt.startswith("You are continuing an existing Slack thread"):
+            assert "TWORKSPACE" in prompt and "CINBOX" in prompt
+            assert "1.000000" in prompt and "3.000000" in prompt
+            assert "Slack MCP" in prompt and "Do not replay" in prompt
+            assert "recover my session" not in prompt and "do not run" not in prompt
+            turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
+            if restart == "missing":
+                recovered.add(thread)
+                answer = "SLACK_CONTEXT_READY"
+            elif restart == "history-failure":
+                answer = "SLACK_CONTEXT_UNAVAILABLE"
+            else:
+                answer = "I could only read some of the history."
+            completed(thread, turn, answer)
+            send({"id": message["id"], "result": {"turn": turn}})
+            continue
         if restart == "missing":
             assert thread in recovered
-        prompt = params["input"][0]["text"]
         finishing = None
         if (existing := active.pop(thread, None)) is not None:
             if modes[thread] == "finish-before-followup":

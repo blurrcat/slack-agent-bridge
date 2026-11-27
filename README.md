@@ -64,12 +64,11 @@ side effects before sending a new prompt.
 If Codex confirms the session is missing, the bridge opens a replacement in
 the same thread and asks it to recover context before running the new prompt.
 If the SQLite mapping is gone, the bridge first checks that the root message
-was posted by an authorized inbox initiator. Recovery requires Codex to have
-a Slack MCP server named `slack`, with access to the private inbox and the
-`slack_read_thread` tool. The bridge requires structured thread messages and
-follows pagination before submitting the new prompt. If history is missing,
-incomplete, or not in a verifiable format, it reports the recovery failure
-in Slack and does not run the prompt.
+was posted by an authorized inbox initiator. The replacement Codex agent
+uses its configured Slack MCP tools to read the private thread. The bridge
+submits the new prompt only after the agent confirms it read the history.
+If it cannot confirm recovery, the bridge reports that in Slack and does
+not run the new prompt.
 The SQLite database uses WAL and lives at
 `$XDG_STATE_HOME/slack-agent-bridge/state.sqlite3` (default:
 `~/.local/state/slack-agent-bridge/state.sqlite3`). The `--config` flag does
