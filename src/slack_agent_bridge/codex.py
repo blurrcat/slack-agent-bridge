@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import itertools
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -10,7 +13,9 @@ log = logging.getLogger(__name__)
 
 
 class CodexError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, no_active_turn: bool = False):
+        super().__init__(message)
+        self.no_active_turn = no_active_turn
 
 
 class Codex:
@@ -20,29 +25,34 @@ class Codex:
         result = await self._request("thread/start", {})
         return result["thread"]["id"]
 
-    async def first_reply(self, thread_id: str, prompt: str) -> str:
-        messages: asyncio.Queue = asyncio.Queue()
-        self._turns[thread_id] = messages
+    async def start_turn(self, thread_id: str, prompt: str) -> Turn:
+        turn = Turn(thread_id)
+        self._turns[thread_id] = turn
         try:
-            result = await self._request("turn/start", {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
-            })
-            turn_id = result["turn"]["id"]
-            answer = ""
-            while True:
-                event = await messages.get()
-                if event is None:
-                    raise CodexError("Codex disconnected before finishing the turn.")
-                method, params = event
-                if method == "item/completed" and params["turnId"] == turn_id:
-                    answer = params["item"]["text"]
-                if method == "turn/completed" and params["turn"]["id"] == turn_id:
-                    if params["turn"]["status"] != "completed" or not answer.strip():
-                        raise CodexError("Codex did not complete a text reply.")
-                    return answer
-        finally:
+            result = await self._request("turn/start", {"threadId": thread_id, "input": text_input(prompt)})
+            turn.id = result["turn"]["id"]
+            return turn
+        except BaseException:
             self._turns.pop(thread_id, None)
+            raise
+
+    async def steer(self, turn: Turn, prompt: str) -> None:
+        await self._request("turn/steer", {
+            "threadId": turn.thread_id, "expectedTurnId": turn.id, "input": text_input(prompt),
+        })
+
+    async def interrupt(self, turn: Turn) -> None:
+        await self._request("turn/interrupt", {"threadId": turn.thread_id, "turnId": turn.id})
+
+    async def answer_request(self, request_id: int | str, result: dict) -> None:
+        await self._send({"id": request_id, "result": result})
+
+    async def reject_request(self, request_id: int | str) -> None:
+        await self._send({"id": request_id, "error": {"code": -32601, "message": "Request not supported here."}})
+
+    def release_turn(self, turn: Turn) -> None:
+        if self._turns.get(turn.thread_id) is turn:
+            self._turns.pop(turn.thread_id)
 
     def __init__(self, command: tuple[str, ...], cwd: Path | None = None, *, secrets: tuple[str, ...] = ()):
         self.command = command
@@ -51,7 +61,7 @@ class Codex:
         self.closed = asyncio.Event()
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
-        self._turns: dict[str, asyncio.Queue] = {}
+        self._turns: dict[str, Turn] = {}
 
     async def __aenter__(self):
         env = {
@@ -107,7 +117,10 @@ class Codex:
         finally:
             self._pending.pop(request_id, None)
         if "error" in reply:
-            raise CodexError(f"Codex rejected {method}.")
+            reason = str(reply["error"].get("message", "")).strip().lower().rstrip(".")
+            raise CodexError(f"Codex rejected {method}.", no_active_turn=reason in {
+                "no active turn", "no active turn to steer", "no active turn to interrupt",
+            })
         return reply["result"]
 
     async def _read(self) -> None:
@@ -119,19 +132,25 @@ class Codex:
                 method = message.get("method")
                 if request_id is not None:
                     if method is not None:
-                        await self._send({
-                            "id": request_id,
-                            "error": {"code": -32601, "message": "Interactive requests are not supported yet."},
-                        })
+                        params = message.get("params", {})
+                        turn = self._turns.get(params.get("threadId"))
+                        if turn is not None and not turn.stopped.is_set():
+                            turn.events.put_nowait(("request", params | {"request_id": request_id, "method": method}))
+                        else:
+                            await self.reject_request(request_id)
                     elif (future := self._pending.get(request_id)) is not None and not future.done():
                         future.set_result(message)
-                elif method in {"item/completed", "turn/completed"}:
+                elif method in {"item/completed", "turn/completed", "serverRequest/resolved"}:
                     params = message["params"]
-                    queue = self._turns.get(params["threadId"])
-                    if queue is not None and (
-                        method == "turn/completed" or params["item"]["type"] == "agentMessage"
-                    ):
-                        queue.put_nowait((method, params))
+                    turn = self._turns.get(params["threadId"])
+                    if turn is not None:
+                        if method == "turn/completed":
+                            if turn.id is not None and params["turn"]["id"] != turn.id:
+                                continue
+                            turn.stopped.set()
+                        elif method == "serverRequest/resolved":
+                            turn.resolved_requests.add(params["requestId"])
+                        turn.events.put_nowait((method, params))
         except (OSError, ValueError, TypeError, KeyError, AttributeError, CodexError) as error:
             log.warning("Could not read Codex stdio (%s).", type(error).__name__)
         finally:
@@ -139,8 +158,9 @@ class Codex:
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(CodexError("Codex app-server disconnected."))
-            for queue in self._turns.values():
-                queue.put_nowait(None)
+            for turn in self._turns.values():
+                turn.stopped.set()
+                turn.events.put_nowait(None)
 
     async def _send(self, message: dict) -> None:
         assert self._process.stdin is not None
@@ -155,3 +175,17 @@ class Codex:
         while await self._process.stderr.read(65536):
             # Keep the pipe flowing without logging host or tool data.
             pass
+
+
+
+def text_input(prompt: str) -> list[dict]:
+    return [{"type": "text", "text": prompt, "text_elements": []}]
+
+@dataclass(eq=False)
+class Turn:
+    thread_id: str
+    id: str | None = None
+    interrupting: bool = False
+    resolved_requests: set[int | str] = field(default_factory=set)
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+    events: asyncio.Queue[tuple[str, dict] | None] = field(default_factory=asyncio.Queue)
