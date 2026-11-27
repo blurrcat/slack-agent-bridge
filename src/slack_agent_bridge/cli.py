@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
             asyncio.run(serve(config, path.with_name("state.sqlite3")))
         return 0
-    except (ConfigError, CodexError, BridgeError, OSError) as error:
+    except (ConfigError, CodexError, BridgeError, OSError, sqlite3.Error) as error:
         print(f"slack-agent-bridge: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

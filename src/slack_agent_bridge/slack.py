@@ -2,6 +2,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from aiohttp import ClientError
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.aiohttp import SocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -53,9 +54,10 @@ class SlackOutput:
     async def started(self, thread: SlackThread) -> None:
         try:
             await self.web.reactions_add(channel=thread.channel_id, timestamp=thread.root_ts, name="eyes")
-        except SlackApiError as error:
-            if error.response.get("error") != "already_reacted":
-                log.warning("Could not add the eyes reaction to %s/%s", thread.channel_id, thread.root_ts)
+        except (SlackApiError, ClientError, TimeoutError) as error:
+            if isinstance(error, SlackApiError) and error.response.get("error") == "already_reacted":
+                return
+            log.warning("Could not add the eyes reaction to %s/%s", thread.channel_id, thread.root_ts)
 
     async def reply(self, thread: SlackThread, text: str) -> None:
         # Escape Slack's special angle-bracket syntax, including group mentions.
@@ -73,7 +75,6 @@ async def serve(config: Config, database: Path) -> None:
     except SlackApiError:
         raise BridgeError("Slack bot authentication failed. Check the bot token.") from None
 
-    socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
     with SessionStore(database) as store:
         async with Codex(config.codex_command, config.codex_cwd, secrets=(
             config.slack_app_token, config.slack_bot_token,
@@ -92,8 +93,9 @@ async def serve(config: Config, database: Path) -> None:
                     if request.type == "events_api" and (origin := message_from_event(request.payload)):
                         jobs.create_task(handle(origin))
 
-                socket.socket_mode_request_listeners.append(on_request)
+                socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
                 try:
+                    socket.socket_mode_request_listeners.append(on_request)
                     try:
                         await socket.connect()
                     except SlackApiError:

@@ -47,21 +47,28 @@ class Session:
 class SessionStore:
     def __init__(self, path: Path):
         self._db = sqlite3.connect(path)
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                workspace_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                root_ts TEXT NOT NULL,
-                origin_event_id TEXT NOT NULL,
-                initiator_id TEXT NOT NULL,
-                initiator_is_bot INTEGER NOT NULL,
-                harness_thread_id TEXT,
-                kind TEXT NOT NULL DEFAULT 'inbox',
-                state TEXT NOT NULL DEFAULT 'creating',
-                PRIMARY KEY (workspace_id, channel_id, root_ts),
-                UNIQUE (workspace_id, origin_event_id)
-            )
-        """)
+        try:
+            mode = self._db.execute("PRAGMA journal_mode = WAL").fetchone()
+            if mode != ("wal",):
+                raise sqlite3.OperationalError("Could not enable WAL for the bridge database.")
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    workspace_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    root_ts TEXT NOT NULL,
+                    origin_event_id TEXT NOT NULL,
+                    initiator_id TEXT NOT NULL,
+                    initiator_is_bot INTEGER NOT NULL,
+                    harness_thread_id TEXT,
+                    kind TEXT NOT NULL DEFAULT 'inbox',
+                    state TEXT NOT NULL DEFAULT 'creating',
+                    PRIMARY KEY (workspace_id, channel_id, root_ts),
+                    UNIQUE (workspace_id, origin_event_id)
+                )
+            """)
+        except sqlite3.Error:
+            self._db.close()
+            raise
 
     def __enter__(self):
         return self

@@ -1,8 +1,12 @@
 import asyncio
 import itertools
 import json
+import logging
 import os
 from pathlib import Path
+
+
+log = logging.getLogger(__name__)
 
 
 class CodexError(RuntimeError):
@@ -30,9 +34,10 @@ class Codex:
         self._process = await asyncio.create_subprocess_exec(
             *self.command, cwd=self.cwd, env=env, limit=2**22,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         self._reader = asyncio.create_task(self._read())
+        self._stderr = asyncio.create_task(self._drain_stderr())
         try:
             await self._request("initialize", {
                 "clientInfo": {"name": "slack_agent_bridge", "version": "0.1.0"},
@@ -56,7 +61,14 @@ class Codex:
             await self._process.wait()
         finally:
             self._reader.cancel()
-            await asyncio.gather(self._reader, return_exceptions=True)
+            self._stderr.cancel()
+            await asyncio.gather(self._reader, self._stderr, return_exceptions=True)
+
+    async def _drain_stderr(self) -> None:
+        assert self._process.stderr is not None
+        while await self._process.stderr.read(65536):
+            # Keep the pipe flowing without logging host or tool data.
+            pass
 
     async def _send(self, message: dict) -> None:
         assert self._process.stdin is not None
@@ -106,9 +118,8 @@ class Codex:
                         method == "turn/completed" or params["item"]["type"] == "agentMessage"
                     ):
                         queue.put_nowait((method, params))
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, CodexError):
-            # Do not write protocol payloads or tool output to default logs.
-            pass
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, CodexError) as error:
+            log.warning("Could not read Codex stdio (%s).", type(error).__name__)
         finally:
             self.closed.set()
             for future in self._pending.values():
@@ -131,19 +142,16 @@ class Codex:
             })
             turn_id = result["turn"]["id"]
             answer = ""
-            async with asyncio.timeout(300):
-                while True:
-                    event = await messages.get()
-                    if event is None:
-                        raise CodexError("Codex disconnected before finishing the turn.")
-                    method, params = event
-                    if method == "item/completed" and params["turnId"] == turn_id:
-                        answer = params["item"]["text"]
-                    if method == "turn/completed" and params["turn"]["id"] == turn_id:
-                        if params["turn"]["status"] != "completed" or not answer.strip():
-                            raise CodexError("Codex did not complete a text reply.")
-                        return answer
-        except TimeoutError:
-            raise CodexError("Codex did not confirm completion of the turn.") from None
+            while True:
+                event = await messages.get()
+                if event is None:
+                    raise CodexError("Codex disconnected before finishing the turn.")
+                method, params = event
+                if method == "item/completed" and params["turnId"] == turn_id:
+                    answer = params["item"]["text"]
+                if method == "turn/completed" and params["turn"]["id"] == turn_id:
+                    if params["turn"]["status"] != "completed" or not answer.strip():
+                        raise CodexError("Codex did not complete a text reply.")
+                    return answer
         finally:
             self._turns.pop(thread_id, None)
