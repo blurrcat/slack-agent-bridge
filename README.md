@@ -52,8 +52,23 @@ Only the owner can use approval or input controls and close a session with
 `!done` or `!end`. Approval cards offer **Approve once**, **Approve for session**,
 or **Decline**. Session approvals are handled by Codex, not stored by the bridge.
 Closing interrupts active work, adds ✅ to the initial request, and posts “Bye.”
-Slack is not used for secret inputs. Session recovery and joined threads are not
-yet supported.
+Slack is not used for secret inputs. Joined threads are not yet supported.
+
+### Continue an inbox session after restart
+
+Send a new reply in the same Slack thread to resume its mapped Codex session.
+The bridge does not scan for missed jobs or retry a prompt whose outcome is
+unknown. If the bridge reports that Codex did not confirm a reply, check for
+side effects before sending a new prompt.
+
+If Codex confirms the session is missing, the bridge opens a replacement in
+the same thread and asks it to recover context before running the new prompt.
+If the SQLite mapping is gone, the bridge first checks that the root message
+was posted by an authorized inbox initiator. The replacement Codex agent
+uses its configured Slack MCP tools to read the private thread. The bridge
+submits the new prompt only after the agent confirms it read the history.
+If it cannot confirm recovery, the bridge reports that in Slack and does
+not run the new prompt.
 The SQLite database uses WAL and lives at
 `$XDG_STATE_HOME/slack-agent-bridge/state.sqlite3` (default:
 `~/.local/state/slack-agent-bridge/state.sqlite3`). The `--config` flag does
@@ -98,8 +113,8 @@ Ctrl-C stops it. This setup does not start automatically after a reboot.
 
 To upgrade, **stop the running bridge first**, then pull and sync the
 deployment checkout and run the same tmux start command. The config and
-SQLite state stay in place. Restarting currently does not resume existing
-sessions.
+SQLite state stay in place. Existing sessions resume on the next authorized
+reply, not at startup.
 
 ```sh
 git -C ~/deployments/slack-agent-bridge/checkout pull --ff-only origin main

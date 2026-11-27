@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import re
+from decimal import Decimal
 from pathlib import Path
+from time import time_ns
 
 from aiohttp import ClientError
 from slack_sdk.errors import SlackApiError
@@ -51,13 +53,18 @@ async def serve(config: Config, database: Path) -> None:
                     if request.envelope_id:
                         await client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
                     if request.type == "events_api" and (origin := message_from_event(request.payload)):
-                        jobs.create_task(handle(origin))
+                        if Decimal(origin.message_ts) >= listening_since:
+                            jobs.create_task(handle(origin))
+                        else:
+                            log.debug("Ignoring Slack event %s posted before listener startup.", origin.event_id)
                     elif request.type == "interactive" and (action := interaction_from_payload(request.payload)):
                         jobs.create_task(interact(action))
 
                 socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
                 try:
                     socket.socket_mode_request_listeners.append(on_request)
+                    # Do not run delayed messages Slack delivers from before this listener started.
+                    listening_since = Decimal(time_ns()) / 1_000_000_000
                     try:
                         await socket.connect()
                     except SlackApiError:
@@ -134,6 +141,28 @@ def interaction_from_payload(payload: dict) -> Interaction | None:
 class SlackOutput:
     def __init__(self, web: AsyncWebClient):
         self.web = web
+
+    async def origin_message(self, thread: SlackThread) -> SlackMessage | None:
+        try:
+            response = await self.web.conversations_history(
+                channel=thread.channel_id, latest=thread.root_ts, inclusive=True, limit=1,
+            )
+        except (SlackApiError, ClientError, TimeoutError) as error:
+            log.warning("Could not verify inbox origin %s/%s (%s).",
+                        thread.channel_id, thread.root_ts, type(error).__name__)
+            return None
+
+        messages = response.get("messages")
+        if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
+            return None
+        # History has no event ID; this message is only used to validate the origin.
+        origin = message_from_event({
+            "team_id": thread.workspace_id, "event_id": thread.root_ts,
+            "event": {**messages[0], "channel": thread.channel_id},
+        })
+        if origin is None or origin.thread != thread or not origin.is_root:
+            return None
+        return origin
 
     async def started(self, thread: SlackThread) -> None:
         await self._reaction(thread, thread.root_ts, "eyes", True)

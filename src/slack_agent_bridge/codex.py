@@ -19,12 +19,49 @@ class CodexError(RuntimeError):
         self.no_active_turn = no_active_turn
 
 
+class CodexSessionMissing(CodexError):
+    pass
+
+
 class Codex:
     """One app-server connection; requests and notifications can interleave."""
 
     async def start_thread(self) -> str:
         result = await self._request("thread/start", {})
         return result["thread"]["id"]
+
+    async def resume_thread(self, thread_id: str) -> None:
+        result = await self._request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+        if result.get("thread", {}).get("id") != thread_id:
+            raise CodexError("Codex did not confirm the mapped thread.")
+
+    async def prime_thread(self, thread_id: str, prompt: str) -> str:
+        """Run a context-only turn without presenting interactive requests in Slack."""
+        turn = await self.submit(thread_id, prompt)
+        answer = ""
+        try:
+            async with asyncio.timeout(60):
+                while (event := await turn.events.get()) is not None:
+                    method, params = event
+                    if method == "request" and params["request_id"] not in turn.resolved_requests:
+                        await self.reject_request(params["request_id"])
+                    elif method == "item/completed" and params["turnId"] == turn.id:
+                        item = params["item"]
+                        if item["type"] == "agentMessage":
+                            answer = item["text"]
+                    elif method == "turn/completed" and params["turn"]["id"] == turn.id:
+                        if params["turn"]["status"] == "completed":
+                            return answer.strip()
+                        break
+        except TimeoutError:
+            try:
+                async with asyncio.timeout(3):
+                    if not turn.stopped.is_set():
+                        await self.interrupt(turn)
+            except (CodexError, TimeoutError):
+                log.warning("Codex did not confirm interruption of the priming turn.")
+            raise CodexError("Codex did not finish priming the replacement session in time.") from None
+        raise CodexError("Codex did not complete the priming turn.")
 
     async def submit(self, thread_id: str, prompt: str) -> Turn:
         """Start or steer; return the same Turn object if Codex steers it."""
@@ -117,7 +154,16 @@ class Codex:
         finally:
             self._pending.pop(request_id, None)
         if "error" in reply:
-            reason = str(reply["error"].get("message", "")).strip().lower().rstrip(".")
+            error = reply["error"]
+            reason = str(error.get("message", "")).strip().lower().rstrip(".")
+            if (
+                method == "thread/resume" and error.get("code") in {-32600, -32603}
+                and reason in {
+                    f"no rollout found for thread id {params['threadId'].lower()}",
+                    f"invalid thread-store request: no rollout found for thread id {params['threadId'].lower()}",
+                }
+            ):
+                raise CodexSessionMissing("Codex could not find the mapped session.", rejected=True)
             raise CodexError(f"Codex rejected {method}.", rejected=True, no_active_turn=reason in {
                 "no active turn", "no active turn to interrupt",
             })
@@ -156,10 +202,10 @@ class Codex:
     def _notify(self, method: str, params: dict) -> None:
         thread_id = params["threadId"]
         if method == "serverRequest/resolved":
-            for turn in self._turns.values():
-                if turn.thread_id == thread_id:
-                    turn.resolved_requests.add(params["requestId"])
-                    turn.events.put_nowait((method, params))
+            for active in self._turns.values():
+                if active.thread_id == thread_id:
+                    active.resolved_requests.add(params["requestId"])
+                    active.events.put_nowait((method, params))
             return
 
         turn_id = params["turn"]["id"] if method in {"turn/started", "turn/completed"} else params["turnId"]

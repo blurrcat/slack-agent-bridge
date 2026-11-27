@@ -4,7 +4,10 @@ import itertools
 import json
 import sys
 
-threads = itertools.count(1)
+restart = sys.argv[1] if len(sys.argv) > 1 else None
+threads = itertools.count(2 if restart else 1)
+loaded = set()
+recovered = set()
 turns = itertools.count(1)
 active = {}
 pending = {}
@@ -42,10 +45,42 @@ for line in sys.stdin:
     if method == "initialize":
         result = {}
     elif method == "thread/start":
-        result = {"thread": {"id": f"codex-{next(threads)}"}}
+        thread = f"codex-{next(threads)}"
+        loaded.add(thread)
+        result = {"thread": {"id": thread}}
+    elif method == "thread/resume":
+        thread = params["threadId"]
+        if restart == "crash":
+            sys.exit(1)
+        if restart != "resume" or thread != "codex-1":
+            send({"id": message["id"], "error": {
+                "code": -32600, "message": f"no rollout found for thread id {thread}",
+            }})
+            continue
+        loaded.add(thread)
+        result = {"thread": {"id": thread}}
     elif method == "turn/start":
         thread = params["threadId"]
+        assert thread in loaded
         prompt = params["input"][0]["text"]
+        if prompt.startswith("You are continuing an existing Slack thread"):
+            assert "TWORKSPACE" in prompt and "CINBOX" in prompt
+            assert "1.000000" in prompt and "3.000000" in prompt
+            assert "Slack MCP" in prompt and "Do not replay" in prompt
+            assert "recover my session" not in prompt and "do not run" not in prompt
+            turn = {"id": f"turn-{next(turns)}", "status": "inProgress"}
+            if restart == "missing":
+                recovered.add(thread)
+                answer = "SLACK_CONTEXT_READY"
+            elif restart == "history-failure":
+                answer = "SLACK_CONTEXT_UNAVAILABLE"
+            else:
+                answer = "I could only read some of the history."
+            completed(thread, turn, answer)
+            send({"id": message["id"], "result": {"turn": turn}})
+            continue
+        if restart == "missing":
+            assert thread in recovered
         finishing = None
         if (existing := active.pop(thread, None)) is not None:
             if modes[thread] == "finish-before-followup":
