@@ -14,3 +14,5 @@ settings:
     bot_events:
       - message.groups
   socket_mode_enabled: true
+  interactivity:
+    is_enabled: true

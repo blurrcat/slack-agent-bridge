@@ -13,11 +13,11 @@ private channel.
 
 Get a bot token (`xoxb-…`) from **OAuth & Permissions**. In **Basic
 Information → App-Level Tokens**, generate an app token (`xapp-…`) with
-`connections:write`. Enable **Socket Mode** and **Event Subscriptions**.
+`connections:write`. Enable **Socket Mode**, **Event Subscriptions**, and **Interactivity**.
 
 ## Install and run
 
-Have a working, signed-in Codex CLI on this machine. Install the bridge with
+Have a working, signed-in Codex CLI (0.171.0 or later) on this machine. Install the bridge with
 [uv](https://docs.astral.sh/uv/):
 
 ```sh
@@ -43,7 +43,17 @@ Optional JSON fields:
 
 Post a new top-level message from an authorized sender. The bridge adds 👀
 when the Codex session opens and posts the first reply under that message.
-This slice does not handle follow-ups, commands, or session recovery yet.
+Reply in the thread to start a new turn, or steer the current turn if Codex
+is still working. Only the owner or the human who submitted the job can
+prompt or use `!esc`. The hourglass marks a running turn. Tool summaries
+show the type of action and its outcome, not raw output.
+
+Only the owner can use approval or input controls and close a session with
+`!done` or `!end`. Approval cards offer **Approve once**, **Approve for session**,
+or **Decline**. Session approvals are handled by Codex, not stored by the bridge.
+Closing interrupts active work, adds ✅ to the initial request, and posts “Bye.”
+Slack is not used for secret inputs. Session recovery and joined threads are not
+yet supported.
 The SQLite database uses WAL and lives at
 `$XDG_STATE_HOME/slack-agent-bridge/state.sqlite3` (default:
 `~/.local/state/slack-agent-bridge/state.sqlite3`). The `--config` flag does
