@@ -60,6 +60,52 @@ The SQLite database uses WAL and lives at
 not change this path. Run only one instance per inbox. Stop the bridge
 before copying its database to another host.
 
+## Deploy separately from your dev checkout
+
+Keep the bridge code you run under `~/deployments/slack-agent-bridge` so
+changes in your development checkout don't affect the running bridge.
+Install from the GitHub `main` branch into a dedicated virtual environment:
+
+```sh
+mkdir -p -m 700 ~/deployments/slack-agent-bridge/work
+git clone --single-branch --branch main https://github.com/blurrcat/slack-agent-bridge.git \
+  ~/deployments/slack-agent-bridge/checkout
+uv --directory ~/deployments/slack-agent-bridge/checkout sync --locked --no-dev
+```
+
+If you haven't configured the bridge already, run the deployed CLI's
+`init` command once. The credentials stay in
+`~/.config/slack-agent-bridge/config.json`, outside both Git checkouts.
+
+```sh
+~/deployments/slack-agent-bridge/checkout/.venv/bin/slack-agent-bridge init
+```
+
+Start the deployed CLI in its own tmux session. Running from `work/` keeps
+Codex's default working directory separate from the deployed code. Set
+`codex_cwd` in the config to work in a specific project instead.
+
+```sh
+tmux new-session -d -s slack-agent-bridge \
+  -c ~/deployments/slack-agent-bridge/work \
+  ~/deployments/slack-agent-bridge/checkout/.venv/bin/slack-agent-bridge run
+```
+
+Use `tmux attach -t slack-agent-bridge` to view logs, or
+`tmux switch-client -t slack-agent-bridge` if you're already in tmux.
+Check for `Listening in …`. Detaching leaves the bridge running; pressing
+Ctrl-C stops it. This setup does not start automatically after a reboot.
+
+To upgrade, **stop the running bridge first**, then pull and sync the
+deployment checkout and run the same tmux start command. The config and
+SQLite state stay in place. Restarting currently does not resume existing
+sessions.
+
+```sh
+git -C ~/deployments/slack-agent-bridge/checkout pull --ff-only origin main
+uv --directory ~/deployments/slack-agent-bridge/checkout sync --locked --no-dev
+```
+
 ## Tests
 
 ```sh
