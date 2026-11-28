@@ -1,3 +1,5 @@
+"""FIFO worker for the Bridge's outbound Slack operations."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,33 +21,42 @@ log = logging.getLogger(__name__)
 
 
 class SlackOutbox:
+    """Enqueue casts synchronously and run all Web API calls in one worker."""
     def __init__(self, web: AsyncWebClient):
         self._web = web
         self._queue: asyncio.Queue[_Write] = asyncio.Queue()
 
     def started(self, thread: SlackThread) -> None:
+        """Queue the acceptance reaction after the Agent Session opens."""
         self._queue.put_nowait(_Reaction(thread, "eyes"))
 
     def closed(self, thread: SlackThread) -> None:
+        """Queue the close reaction; a subsequent farewell will follow it in FIFO order."""
         self._queue.put_nowait(_Reaction(thread, "white_check_mark"))
 
     def reply(self, thread: SlackThread, text: str) -> None:
+        """Queue a threaded reply without waiting for Slack."""
         self._queue.put_nowait(_Reply(thread, text))
 
     def post_card(self, thread: SlackThread, token: str, text: str,
                   buttons: tuple[tuple[str, str], ...]) -> None:
+        """Queue a card whose timestamp or failure will come back as an event."""
         self._queue.put_nowait(_Card(thread, token, text, buttons))
 
     def disable_card(self, thread: SlackThread, ts: str) -> None:
+        """Queue removal of the buttons without claiming the request was approved."""
         self._queue.put_nowait(_DisableCard(thread, ts))
 
     def lookup_origin(self, thread: SlackThread) -> None:
+        """Queue a history read and report the exact root message, if available."""
         self._queue.put_nowait(_LookupOrigin(thread))
 
     def open_questions(self, trigger_id: str, token: str, questions: tuple[ModalQuestion, ...]) -> None:
+        """Queue use of a short-lived trigger; report failure so the Owner can retry."""
         self._queue.put_nowait(_Modal(trigger_id, token, questions))
 
     async def run(self, publish: Callable[[SlackEvent], None]) -> None:
+        """Execute one command at a time and publish only outcomes that change Bridge policy."""
         while True:
             write = await self._queue.get()
             try:
@@ -64,6 +75,7 @@ class SlackOutbox:
                     publish(outcome)
 
     async def _write(self, write: _Write) -> SlackEvent | None:
+        """Translate one queued command into Slack SDK calls."""
         match write:
             case _Reaction(thread, emoji):
                 await self._web.reactions_add(channel=thread.channel_id, timestamp=thread.root_ts, name=emoji)
@@ -105,6 +117,7 @@ class SlackOutbox:
 
 @dataclass(frozen=True)
 class ModalQuestion:
+    """Slack presentation data; validation and question IDs stay with the Bridge."""
     label: str
     hint: str
     choices: tuple[str, ...]
@@ -152,6 +165,7 @@ _Write = _Reaction | _Reply | _Card | _DisableCard | _Modal | _LookupOrigin
 
 
 def _modal(token: str, questions: tuple[ModalQuestion, ...]) -> dict[str, Any]:
+    """Build Slack Block Kit input rows addressed by their question position."""
     blocks: list[dict[str, Any]] = []
     for index, question in enumerate(questions):
         if question.hint:
@@ -176,6 +190,7 @@ def _plain(text: str) -> dict[str, str]:
 
 
 def _preview(text: str) -> str:
+    """Fit approval details into Slack's section limit with an explicit truncation marker."""
     suffix = "\n\n[Approval details trimmed]"
     return text if len(text) <= 3000 else text[:3000 - len(suffix)] + suffix
 
@@ -186,6 +201,7 @@ def _escape(text: str) -> str:
 
 
 def _exact_origin(thread: SlackThread, messages: object) -> SlackMessagePosted | None:
+    """Reject nearby messages: only the requested root can authorize recovery."""
     if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
         return None
     record = messages[0]

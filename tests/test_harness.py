@@ -1,3 +1,5 @@
+"""Exercise Codex command and notification races across a real subprocess pipe."""
+
 import asyncio
 import sys
 import tempfile

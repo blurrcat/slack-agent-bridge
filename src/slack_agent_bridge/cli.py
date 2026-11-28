@@ -1,3 +1,5 @@
+"""CLI entry point and composition of the Bridge's transport adapters."""
+
 import argparse
 import asyncio
 import logging
@@ -47,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 async def serve(config: Config, database: Path) -> None:
+    """Authenticate Slack, start Codex, and run the dispatcher with process-scoped resources."""
     async with ClientSession() as http:
         web = AsyncWebClient(token=config.slack_bot_token, session=http)
         try:
@@ -71,6 +74,7 @@ async def serve(config: Config, database: Path) -> None:
 
 
 def _failure_message(error: BaseException) -> str:
+    """Summarize supervised failures without leaking raw SDK payloads."""
     if isinstance(error, BaseExceptionGroup):
         return "; ".join(dict.fromkeys(_failure_message(nested) for nested in error.exceptions))
     if isinstance(error, (HarnessError, BridgeError)):
@@ -79,6 +83,7 @@ def _failure_message(error: BaseException) -> str:
 
 
 def state_path() -> Path:
+    """Keep runtime state independent of the location of the config file."""
     base = Path(os.environ.get("XDG_STATE_HOME", ""))
     if not base.is_absolute():
         base = Path.home() / ".local" / "state"

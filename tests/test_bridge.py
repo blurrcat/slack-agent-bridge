@@ -1,3 +1,5 @@
+"""Integration scenarios through the Bridge and its Slack and Codex transport seams."""
+
 import asyncio
 import sys
 import tempfile

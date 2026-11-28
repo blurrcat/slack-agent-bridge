@@ -1,3 +1,5 @@
+"""Exercise Socket Mode decoding and acknowledgment at the SDK seam."""
+
 import asyncio
 import unittest
 from contextlib import aclosing

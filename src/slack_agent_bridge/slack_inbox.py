@@ -1,3 +1,5 @@
+"""Socket Mode intake and Slack payload decoding, without Bridge policy."""
+
 from __future__ import annotations
 
 import asyncio
@@ -21,18 +23,22 @@ log = logging.getLogger(__name__)
 
 
 class SlackInbox:
+    """Single-consumer Slack event source; it does not authorize or route work."""
     def __init__(self, socket: SocketModeClient):
         self._socket = socket
 
     async def events(self) -> AsyncIterator[SlackEvent]:
+        """Yield supported observations until the SDK processor exits or the pump is cancelled."""
         queue: asyncio.Queue[SlackEvent | None] = asyncio.Queue()
 
         def processor_stopped(task: asyncio.Future[None]) -> None:
+            """Wake the iterator so the Bridge can see that its producer ended."""
             if not task.cancelled() and (error := task.exception()) is not None:
                 log.error("Slack SDK message processor failed (%s).", type(error).__name__)
             queue.put_nowait(None)
 
         async def receive(client: AsyncBaseSocketModeClient, request: SocketModeRequest) -> None:
+            """Queue observations and acknowledge even envelopes that have no supported event."""
             event = _decode(request)
             if event is not None:
                 queue.put_nowait(event)
@@ -58,6 +64,7 @@ class SlackInbox:
 
 
 def _decode(request: SocketModeRequest) -> SlackEvent | None:
+    """Decode only the wire shape; leave workspace, channel, and sender checks to Bridge."""
     payload = request.payload
     if request.type == "interactive":
         return _interaction(payload)
@@ -93,6 +100,7 @@ def _decode(request: SocketModeRequest) -> SlackEvent | None:
 
 
 def _interaction(payload: dict[str, Any]) -> SlackInteractionReceived | None:
+    """Preserve button or modal identifiers without interpreting what they authorize."""
     workspace = (
         _string(_object(payload.get("team")).get("id")) or _string(payload.get("app_installed_team_id"))
     )
@@ -127,6 +135,7 @@ def _interaction(payload: dict[str, Any]) -> SlackInteractionReceived | None:
 
 
 def _input_values(state: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+    """Flatten Slack's nested view state into immutable block, action, and value triples."""
     values = []
     for block_id, block in state.items():
         for action_id, raw in _object(block).items():
@@ -148,4 +157,5 @@ def _string(value: object) -> str | None:
 
 
 def _timestamp(value: object) -> str | None:
+    """Validate Slack's timestamp shape without losing its exact string identity."""
     return value if isinstance(value, str) and re.fullmatch(r"[0-9]+\.[0-9]+", value) else None

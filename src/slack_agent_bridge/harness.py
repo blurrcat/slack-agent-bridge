@@ -1,3 +1,5 @@
+"""Codex app-server transport and multiplexed Agent Session lifecycle."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,12 +25,14 @@ Wire = dict[str, Any]
 
 
 class HarnessError(RuntimeError):
+    """An unconfirmed Harness operation or a transport failure."""
     def __init__(self, message: str, *, no_active_turn: bool = False):
         super().__init__(message)
         self.no_active_turn = no_active_turn
 
 
 class HarnessSessionMissing(HarnessError):
+    """Codex explicitly confirmed the requested persisted session is absent."""
     pass
 
 
@@ -49,6 +53,7 @@ class Harness:
         self._running: set[asyncio.Task[None]] = set()
 
     async def start_session(self) -> str:
+        """Wait for a new session ID; no application-event acknowledgment is needed."""
         response = await self._rpc("thread/start", {}, timeout=5)
         session_id = _object(response.get("thread")).get("id")
         if not isinstance(session_id, str) or not session_id:
@@ -57,40 +62,49 @@ class Harness:
         return session_id
 
     async def resume_session(self, session_id: str) -> None:
+        """Subscribe to a known session without reloading its entire turn history."""
         response = await self._rpc("thread/resume", {"threadId": session_id, "excludeTurns": True}, timeout=5)
         if _object(response.get("thread")).get("id") != session_id:
             raise HarnessError("Codex did not confirm the mapped session.")
         self._attach_session(session_id)
 
     def _attach_session(self, session_id: str) -> None:
+        """Give the session its own FIFO so another session can submit independently."""
         session = _Session()
         session.can_submit.set()
         self._sessions[session_id] = session
         session.worker = self._spawn(self._run_session(session_id, session))
 
     def send_message(self, session_id: str, command_id: str, text: str) -> None:
+        """Cast a prompt; receipt matching stays internal unless submission fails."""
         self._sessions[session_id].commands.put_nowait(_Prompt(command_id, text))
 
     def stop_session(self, session_id: str, command_id: str) -> None:
+        """Pause submissions while the stop runs, retaining queued prompts until it succeeds."""
         session = self._sessions[session_id]
         session.can_submit.clear()
         self._spawn(self._stop_session(session_id, session, command_id))
 
     def interrupt(self, session_id: str, turn_id: str, command_id: str) -> None:
+        """Cast an interrupt for the specific turn if it is still known."""
         if (turn := self._sessions[session_id].turns.get(turn_id)) is not None:
             self._spawn(self._interrupt_cast(session_id, turn_id, turn, command_id))
 
     def answer_request(self, key: HarnessRequestKey, response: ApprovalDecision | InputAnswers) -> None:
+        """Cast a typed response; the writer will check that the request is still live."""
         self._spawn(self._respond(key, response))
 
     def reject_request(self, key: HarnessRequestKey) -> None:
+        """Return a protocol error when the Bridge cannot present the request."""
         self._spawn(self._respond(key, None))
 
     async def events(self) -> AsyncIterator[HarnessEvent]:
+        """Expose observations from all attached sessions in arrival order."""
         while True:
             yield await self._events.get()
 
     async def __aenter__(self) -> Harness:
+        """Launch and initialize the child without forwarding the bridge's Slack tokens."""
         env = {
             key: value for key, value in os.environ.items()
             if key not in {"SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"}
@@ -112,6 +126,7 @@ class Harness:
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        """Stop transport tasks, then close stdin before falling back to killing Codex."""
         for task in self._running:
             task.cancel()
         try:
@@ -130,12 +145,14 @@ class Harness:
                 await self._process.wait()
 
     async def _run_session(self, session_id: str, session: _Session) -> None:
+        """Allow one unacknowledged submission per session without waiting for turn completion."""
         while True:
             prompt = await session.commands.get()
             await session.can_submit.wait()
             await self._submit(session_id, session, prompt)
 
     async def _stop_session(self, session_id: str, session: _Session, command_id: str) -> None:
+        """Interrupt observed turns and confirm no pending submission can start another."""
         try:
             async with asyncio.timeout(10):
                 while True:
@@ -151,6 +168,7 @@ class Harness:
                             # receipt is no reason to keep a confirmed stop open.
                             break
                     # A submission may still announce a turn even before its reply arrives.
+                    # Without a matching terminal turn or receipt, don't claim the session stopped.
                     await session.changed.wait()
         except (HarnessError, TimeoutError):
             self._events.put_nowait(HarnessCommandFailed(session_id, command_id, "stop"))
@@ -167,6 +185,7 @@ class Harness:
                 log.warning("Unable to unsubscribe stopped Codex session: %s", error)
 
     async def _submit(self, session_id: str, session: _Session, command: _Prompt) -> None:
+        """Let Codex choose whether this prompt starts a new turn or steers the current one."""
         session.finished_during_submit = set()
         session.turn_started_during_submit = None
         try:
@@ -188,12 +207,14 @@ class Harness:
             session.changed.set()
 
     async def _interrupt_cast(self, session_id: str, turn_id: str, turn: _Turn, command_id: str) -> None:
+        """Report a failed interrupt against the original command and turn IDs."""
         try:
             await self._stop_turn(session_id, turn_id, turn)
         except HarnessError:
             self._events.put_nowait(HarnessCommandFailed(session_id, command_id, "interrupt", turn_id))
 
     async def _stop_turn(self, session_id: str, turn_id: str, turn: _Turn) -> None:
+        """Share one interrupt between a normal interrupt and a concurrent session close."""
         async with turn.interrupt_lock:
             if turn.completed.is_set() or turn.interrupt_acknowledged:
                 return
@@ -202,6 +223,7 @@ class Harness:
             except HarnessError as error:
                 if turn.completed.is_set():
                     return
+                # A completed turn can win this race before stdout delivers its terminal event.
                 if error.no_active_turn:
                     try:
                         async with asyncio.timeout(2):
@@ -214,6 +236,7 @@ class Harness:
                 turn.interrupt_acknowledged = True
 
     async def _respond(self, key: HarnessRequestKey, response: ApprovalDecision | InputAnswers | None) -> None:
+        """Recheck expiry under the write lock before anything reaches stdin."""
         async with self._write_lock:
             pending = self._requests.get((key.session_id, key.request_id))
             if pending is None or pending.key != key or pending.answered:
@@ -234,6 +257,7 @@ class Harness:
             await self._write_wire(message)
 
     async def _read(self) -> None:
+        """Separate server requests, notifications, and replies from a single stdout reader."""
         stdout = self._process.stdout
         assert stdout is not None
         while line := await stdout.readline():
@@ -256,6 +280,7 @@ class Harness:
         raise HarnessError("Codex app-server disconnected.")
 
     def _receive_event(self, method: str, params: Wire) -> None:
+        """Update protocol state before publishing the corresponding immutable fact."""
         session_id = params.get("threadId")
         if not isinstance(session_id, str) or (session := self._sessions.get(session_id)) is None:
             return
@@ -294,6 +319,7 @@ class Harness:
                 ))
 
     async def _receive_request(self, method: str, request_id: int | str, params: Wire) -> None:
+        """Associate a server request with its live session and retain wire-only data."""
         session_id = params.get("threadId")
         turn_id = params.get("turnId")
         if not isinstance(session_id, str) or not isinstance(turn_id, str):
@@ -311,12 +337,14 @@ class Harness:
         self._events.put_nowait(HarnessRequestReceived(key, request))
 
     def _observe_turn(self, session_id: str, session: _Session, turn_id: str) -> None:
+        """Publish one start observation even if several protocol messages introduce the turn."""
         if turn_id not in session.turns:
             session.turns[turn_id] = _Turn()
             session.changed.set()
             self._events.put_nowait(HarnessTurnStarted(session_id, turn_id, time.time_ns()))
 
     def _resolve_request(self, session_id: str, request_id: object) -> None:
+        """Forget the request before publishing its resolution, making late casts inert."""
         if isinstance(request_id, (int, str)):
             pending = self._requests.pop((session_id, request_id), None)
             if pending:
@@ -326,6 +354,7 @@ class Harness:
         await self._send({"id": request_id, "error": _unsupported_request()})
 
     async def _rpc(self, method: str, params: Wire, *, timeout: float = 30) -> Wire:
+        """Match one JSON-RPC receipt independently of the Bridge dispatcher."""
         request_id = next(self._ids)
         future: asyncio.Future[Wire] = asyncio.get_running_loop().create_future()
         self._rpcs[request_id] = future
@@ -354,6 +383,7 @@ class Harness:
             await self._write_wire(message)
 
     async def _write_wire(self, message: Wire) -> None:
+        """Write exactly one newline-delimited message with the writer lock already held."""
         stdin = self._process.stdin
         assert stdin is not None
         stdin.write(json.dumps(message).encode() + b"\n")
@@ -367,6 +397,7 @@ class Harness:
             pass
 
     def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        """Track task lifetimes so shutdown can cancel even an idle session worker."""
         task = self._tasks.create_task(coroutine)
         self._running.add(task)
         task.add_done_callback(self._running.discard)
@@ -375,12 +406,14 @@ class Harness:
 
 @dataclass(frozen=True)
 class _Prompt:
+    """One submission cast and the Bridge ID used to correlate a failure."""
     id: str
     text: str
 
 
 @dataclass
 class _Turn:
+    """Protocol completion and interrupt state, kept inside the Harness."""
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     interrupt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     interrupt_acknowledged: bool = False
@@ -388,6 +421,7 @@ class _Turn:
 
 @dataclass
 class _Session:
+    """Per-session submission and turn state, independent of Slack routing."""
     commands: asyncio.Queue[_Prompt] = field(default_factory=asyncio.Queue)
     worker: asyncio.Task[None] | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -399,12 +433,14 @@ class _Session:
 
 @dataclass
 class _ServerRequest:
+    """Keep request identity and permission payloads private to the transport."""
     key: HarnessRequestKey
     permissions: Wire | None
     answered: bool = False
 
 
 def _decode_request(method: str, params: Wire) -> HarnessApproval | HarnessQuestions | None:
+    """Project supported protocol requests into typed, immutable data."""
     if method == "item/tool/requestUserInput":
         raw = params.get("questions")
         if not isinstance(raw, list):
