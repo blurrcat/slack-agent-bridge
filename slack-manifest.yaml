@@ -8,11 +8,14 @@ oauth_config:
     bot:
       - chat:write
       - groups:history
+      - reactions:read
       - reactions:write
 settings:
   event_subscriptions:
     bot_events:
       - message.groups
+      - reaction_added
+      - reaction_removed
   socket_mode_enabled: true
   interactivity:
     is_enabled: true

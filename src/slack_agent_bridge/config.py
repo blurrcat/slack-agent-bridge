@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-DEFAULT_CODEX_COMMAND = ("codex", "app-server")
+DEFAULT_CODEX_COMMAND = ("codex",)
 
 
 class ConfigError(ValueError):
@@ -80,9 +80,7 @@ def parse_config(data: object) -> Config:
             raise ConfigError(f"{key} must be an array of nonempty strings.")
         return tuple(value)
 
-    command = strings("codex_command", DEFAULT_CODEX_COMMAND)
-    if not command:
-        raise ConfigError("codex_command cannot be empty.")
+    command = _codex_launcher(strings("codex_command", DEFAULT_CODEX_COMMAND))
     cwd = data.get("codex_cwd")
     if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
         raise ConfigError("codex_cwd must be a directory path.")
@@ -96,3 +94,27 @@ def parse_config(data: object) -> Config:
         codex_command=command,
         codex_cwd=Path(cwd).expanduser() if cwd is not None else None,
     )
+
+
+def _codex_launcher(command: tuple[str, ...]) -> tuple[str, ...]:
+    if not command:
+        raise ConfigError("codex_command cannot be empty.")
+    binary, *args = command
+    if "app-server" not in args:
+        return command
+
+    # Older configs included the subcommand and sometimes an explicit stdio flag.
+    subcommand = args.index("app-server")
+    launcher = [binary, *args[:subcommand]]
+    remaining = iter(args[subcommand + 1:])
+    for arg in remaining:
+        if arg in {"--stdio", "--listen=stdio://"}:
+            continue
+        if arg == "--listen":
+            if next(remaining, None) == "stdio://":
+                continue
+            raise ConfigError("The bridge requires the Codex stdio transport.")
+        if arg.startswith("--listen="):
+            raise ConfigError("The bridge requires the Codex stdio transport.")
+        launcher.append(arg)
+    return tuple(launcher)

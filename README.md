@@ -37,21 +37,21 @@ Optional JSON fields:
 
 - `allowed_user_ids`: array of additional Slack user IDs.
 - `allowed_bot_ids`: array of Slack **bot** IDs, not app or bot-user IDs.
-- `codex_command`: executable and argument array, by default
-  `["codex", "app-server"]`. Keep the app server on its stdio transport.
+- `codex_command`: executable followed by optional launcher arguments; defaults to
+  `["codex"]`. The bridge adds `app-server --stdio`. Existing entries that
+  include `app-server` and its stdio transport flags are still accepted.
 - `codex_cwd`: working directory for Codex; by default it inherits yours.
 
 Post a new top-level message from an authorized sender. The bridge adds 👀
 when the Codex session opens and posts the first reply under that message.
 Reply in the thread to start a new turn, or steer the current turn if Codex
 is still working. Only the owner or the human who submitted the job can
-prompt or use `!esc`. The hourglass marks a running turn. Tool summaries
-show the type of action and its outcome, not raw output.
+prompt or use `!esc`.
 
 Only the owner can use approval or input controls and close a session with
 `!done` or `!end`. Approval cards offer **Approve once**, **Approve for session**,
 or **Decline**. Session approvals are handled by Codex, not stored by the bridge.
-Closing interrupts active work, adds ✅ to the initial request, and posts “Bye.”
+Closing requests an interrupt for the known active turn, adds ✅ to the initial request, and posts “Bye.”
 Slack is not used for secret inputs. Joined threads are not yet supported.
 
 ### Continue an inbox session after restart
@@ -108,7 +108,7 @@ tmux new-session -d -s slack-agent-bridge \
 
 Use `tmux attach -t slack-agent-bridge` to view logs, or
 `tmux switch-client -t slack-agent-bridge` if you're already in tmux.
-Check for `Listening in …`. Detaching leaves the bridge running; pressing
+Check for `Connected to Slack Socket Mode.` Detaching leaves the bridge running; pressing
 Ctrl-C stops it. This setup does not start automatically after a reboot.
 
 To upgrade, **stop the running bridge first**, then pull and sync the
