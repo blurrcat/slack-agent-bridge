@@ -43,6 +43,33 @@ class SlackInboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.send_socket_mode_response.await_count, 3)
         socket.close.assert_awaited_once()
 
+    async def test_buffers_delivery_before_event_iteration_and_detaches_on_close(self):
+        socket = AsyncMock()
+        socket.socket_mode_request_listeners = []
+        socket.message_processor = None
+
+        inbox = SlackInbox(socket)
+        socket.connect.assert_not_awaited()
+        receive, = socket.socket_mode_request_listeners
+        await receive(socket, SocketModeRequest(type="events_api", envelope_id="early", payload={
+            "team_id": "TWORKSPACE", "event_id": "EvEarly",
+            "event": {
+                "type": "message", "channel": "COTHER", "user": "UUSER",
+                "ts": "2.000000", "thread_ts": "1.000000", "text": "early reply",
+            },
+        }))
+
+        async with aclosing(inbox.events()) as events:
+            async with asyncio.timeout(0.2):
+                reply = await anext(events)
+            self.assertIsInstance(reply, SlackReplyPosted)
+            self.assertEqual(reply.text, "early reply")
+
+        self.assertEqual(socket.socket_mode_request_listeners, [])
+        socket.send_socket_mode_response.assert_awaited_once()
+        socket.connect.assert_awaited_once()
+        socket.close.assert_awaited_once()
+
     async def test_stream_ends_when_slack_sdk_worker_exits(self):
         socket = AsyncMock()
         socket.socket_mode_request_listeners = []

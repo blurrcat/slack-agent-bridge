@@ -32,26 +32,20 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owner_can_close_while_active_prompt_ack_is_outstanding(self):
         async with running_bridge() as slack:
-            await slack.message("1.000000", "ack-only-after-interrupt")
+            await slack.message("1.000000", "no-prompt-receipt")
             await slack.card("1.000000")
             await slack.message("2.000000", "!done", root="1.000000")
             await slack.posted("1.000000", "Bye.")
+            self.assertEqual(slack.harness_trace.read_text().splitlines(),
+                             ["started", "interrupt", "unsubscribe"])
 
-    async def test_terminal_turn_closes_even_if_prompt_ack_never_comes(self):
+    async def test_prompt_cast_rejection_does_not_block_the_next_prompt(self):
         async with running_bridge() as slack:
-            await slack.message("1.000000", "ack-never-after-terminal")
-            await slack.card("1.000000")
-            await slack.message("2.000000", "!done", root="1.000000")
-            await slack.posted("1.000000", "Bye.")
-
-    async def test_rejected_close_preserves_previously_accepted_queued_prompts(self):
-        async with running_bridge() as slack:
-            await slack.message("1.000000", "hold-ack-reject-interrupt")
-            await slack.card("1.000000")
-            await slack.message("2.000000", "queued prompt", root="1.000000")
-            await slack.message("3.000000", "!done", root="1.000000")
-            await slack.posted("1.000000", "Codex did not confirm the session stopped. You can retry !done.")
-            await slack.posted("1.000000", "steered: queued prompt")
+            await slack.message("1.000000", "reject-prompt")
+            await slack.message("2.000000", "try again", root="1.000000")
+            await slack.posted("1.000000", "codex-1: try again")
+            replies = [value["text"] for method, value in slack.observed if method == "chat_postMessage"]
+            self.assertEqual(replies, ["codex-1: try again"])
 
     async def test_workflow_bot_is_authorized_by_bot_id_and_cannot_reply(self):
         async with running_bridge() as slack:
@@ -107,20 +101,24 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.message("3.000000", "again", root="1.000000")
             await slack.posted("1.000000", "codex-1: again")
 
-    async def test_only_owner_can_approve_and_failed_close_allows_retry(self):
+    async def test_only_owner_can_approve_the_matching_card(self):
         async with running_bridge() as slack:
             await slack.message("1.000000", "approve", user="UGUEST")
             card = await slack.card("1.000000")
             await slack.click(card, "Approve once", user="UGUEST")
             await slack.click(card, "Approve once", channel="OTHER")
-            await slack.message("2.000000", "!done", root="1.000000")
-            await slack.posted("1.000000", "Codex did not confirm the session stopped. You can retry !done.")
             await slack.click(card, "Approve for session")
             await slack.posted("1.000000", "decision: acceptForSession")
             await slack.find("chat_update", lambda value: value["ts"] == card["ts"])
             await slack.click(card, "Approve once")
             await slack.message("3.000000", "!done", root="1.000000")
             await slack.posted("1.000000", "Bye.")
+
+    async def test_permission_approval_preserves_requested_grant_and_scope(self):
+        async with running_bridge() as slack:
+            await slack.message("1.000000", "permissions")
+            await slack.click(await slack.card("1.000000"), "Approve for session")
+            await slack.posted("1.000000", "decision: session")
 
     async def test_approval_expiry_disables_button_and_late_click_is_harmless(self):
         async with running_bridge() as slack:
@@ -183,6 +181,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await slack.message("2.000000", "next", root="1.000000")
             await slack.posted("1.000000", "finished before follow-up")
             await slack.posted("1.000000", "codex-1: next")
+
+    async def test_late_completion_does_not_clear_the_new_current_turn(self):
+        async with running_bridge() as slack:
+            await slack.message("1.000000", "finish-before-followup")
+            first_card = await slack.card("1.000000")
+            await slack.message("2.000000", "hold", root="1.000000")
+            await slack.card("1.000000", after=first_card["ts"])
+            await slack.posted("1.000000", "finished before follow-up")
+
+            await slack.message(f"{time.time() + 1:.6f}", "!esc", root="1.000000")
+            await slack.posted("1.000000", "Turn interrupted.")
 
     async def test_failed_approval_card_post_does_not_leave_codex_waiting(self):
         async def fail_cards(method, args):
@@ -318,9 +327,9 @@ async def running_bridge(*, before_write=None, database=None, mode="", origin=No
     slack.web.conversations_history.return_value = {"messages": [origin] if origin else []}
     with tempfile.TemporaryDirectory() as tmp:
         trace = Path(tmp) / "harness.log"
-        command = (sys.executable, str(Path(__file__).with_name("fake_codex.py")), str(trace), mode)
+        args = (str(Path(__file__).with_name("fake_codex.py")), str(trace), mode)
         slack.harness_trace = trace
-        async with Harness(command) as harness:
+        async with Harness(sys.executable, args) as harness:
             bridge = Bridge(config, SlackInbox(slack.socket), harness, SlackOutbox(slack.web),
                             database or Path(tmp) / "state.sqlite3", "TWORKSPACE", "UBRIDGE", "BSELF",
                             recovery_timeout=recovery_timeout)

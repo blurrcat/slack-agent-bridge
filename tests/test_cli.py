@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from slack_agent_bridge.cli import main
+from slack_agent_bridge.config import ConfigError, parse_config
 
 
 class InitTests(unittest.TestCase):
@@ -28,6 +29,31 @@ class InitTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertNotEqual(main(["init"]), 0)
             self.assertEqual(path.read_bytes(), original)
+
+
+class CodexLauncherTests(unittest.TestCase):
+    def setUp(self):
+        self.slack = {
+            "inbox_channel_id": "CINBOX",
+            "owner_user_id": "UOWNER",
+            "slack_app_token": "xapp-example",
+            "slack_bot_token": "xoxb-example",
+        }
+
+    def test_default_and_legacy_commands_produce_only_launcher_arguments(self):
+        self.assertEqual(parse_config(self.slack).codex_command, ("codex",))
+        launcher = ("/opt/codex", "-c", 'model="example"')
+        for command in (
+            list(launcher),
+            ["/opt/codex", "app-server", "--stdio", *launcher[1:]],
+            [*launcher, "app-server", "--listen", "stdio://"],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(parse_config({**self.slack, "codex_command": command}).codex_command, launcher)
+
+    def test_legacy_non_stdio_transport_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "requires the Codex stdio transport"):
+            parse_config({**self.slack, "codex_command": ["codex", "app-server", "--listen=unix://"]})
 
 
 class RunTests(unittest.TestCase):

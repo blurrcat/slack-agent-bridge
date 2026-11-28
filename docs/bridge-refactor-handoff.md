@@ -27,8 +27,10 @@ async for event in self.events():
 
 `_handle` uses `match` on concrete event types and calls one private helper per event. Preserve FIFO within each source; don't assume ordering across sources. A handler must never wait for another event on the main queue.
 
-- **Start is a call.** The dispatcher can directly await `harness.start_session()` with a short deadline. The Harness resolves the matching response internally, independently of the Bridge queue. Return a session ID or raise; don't emit an acknowledgment event just to return the result. Add 👀 only after success.
-- **Prompts are casts.** Record a command ID before submission. The Harness preserves submission order within each Agent Session and handles protocol acknowledgments internally. Don't emit a success acknowledgment for every prompt. Emit a correlated failure for rejected or unconfirmed submissions, and don't automatically retry. A turn may start or finish before its submission acknowledgment.
+In the Harness, a **call** registers a waiter and awaits the matching Codex reply. A **cast** only awaits the write to stdin (including backpressure); it does not wait for a reply.
+
+- **Start and resume are calls.** Start needs the session ID; resume needs to distinguish an explicit missing session from an unknown failure before the Bridge can decide to replace it. The Harness reader resolves these calls independently of the Bridge queue. Add 👀 only after start succeeds.
+- **Sending a prompt waits only for the write.** The Bridge awaits `harness.send_message()` until the prompt is written to Codex's stdin, not until Codex acknowledges it or finishes a turn. There is no per-session prompt queue or submission worker. Only calls register reply waiters. The Harness ignores replies to prompt casts, and the Bridge doesn't retry them.
 - **Slack writes are casts.** The Bridge never waits for Slack HTTP. For an approval card, the outbox posts asynchronously and returns its Slack timestamp or failure as an event. The Bridge uses that result to validate clicks or reject a request it couldn't present.
 
 Supervise the dispatcher, both pumps, and the outbox worker together. If either input stream ends unexpectedly or a worker dies, exit nonzero so systemd can restart the bridge. An individual outbound failure is not a dead worker. Don't replay the in-memory queue after restart.
@@ -36,8 +38,8 @@ Supervise the dispatcher, both pumps, and the outbox worker together. If either 
 ## Behavior to preserve
 
 - Keep the current authorization rules, including Owner-only approval and close. Preserve prompt, steer, interrupt, and approval flows. **Remove the hourglass.** Keep GitHub main's suppression of tool-status replies and its existing inbox session recovery; don't extend recovery or add Joined Threads. SQLite keeps its role for mappings and deduplication, not event replay.
-- For `!done` or `!end` during an active turn, mark the session closing, cast the interrupt, and return. Don't accept new prompts or approval clicks while closing. A terminal event finishes the close and causes ✅ and “Bye” to be sent in order. If interruption fails and the turn is still active, leave the session open for retry and report the failure.
-- Codex owns approval expiry. Retire and disable the Slack control when Codex reports the request resolved or the turn ends. A click that races with expiry is a no-op: don't retry it or claim that the approval was applied. Resolution alone does not distinguish an answered request from one Codex cleared.
+- **Interrupt and unsubscribe are casts.** For `!done` or `!end`, the Bridge writes an interrupt for the known current turn, if any, then separately writes an unsubscribe. After both writes, it removes live routing and sends ✅ and “Bye” in order. That confirms local close, not that Codex acknowledged the interrupt. For `!esc`, use the turn's terminal event to report interruption.
+- Codex owns approval expiry; the Bridge owns pending approval state and the Harness only forwards request and resolution events. Retire and disable the Slack control on resolution or turn completion. If expiry races with a response already being written, Codex ignores the late response; don't retry it or claim approval was applied. Resolution alone does not distinguish an answered request from one Codex cleared.
 
 ## Integration checks
 

@@ -62,8 +62,8 @@ async def serve(config: Config, database: Path) -> None:
             raise BridgeError("Slack did not return a workspace and bot user ID.")
         bot_id = auth.get("bot_id")
         try:
-            async with Harness(config.codex_command, config.codex_cwd,
-                               secrets=(config.slack_app_token, config.slack_bot_token)) as harness:
+            binary, *args = config.codex_command
+            async with Harness(binary, tuple(args), cwd=config.codex_cwd) as harness:
                 socket = SocketModeClient(app_token=config.slack_app_token, web_client=web)
                 inbox = SlackInbox(socket)
                 outbox = SlackOutbox(web)

@@ -138,21 +138,6 @@ class HarnessTurnCompleted(HarnessEvent):
 
 
 @dataclass(frozen=True)
-class HarnessSessionStopped(HarnessEvent):
-    """The Harness confirmed that the session has no remaining work."""
-    session_id: str
-
-
-@dataclass(frozen=True)
-class HarnessCommandFailed(HarnessEvent):
-    """A cast could not be confirmed; the ID identifies the original command."""
-    session_id: str
-    command_id: str
-    operation: Literal["prompt", "interrupt", "stop"]
-    turn_id: str | None = None
-
-
-@dataclass(frozen=True)
 class HarnessRequestKey:
     """Scope a protocol request to the session and turn that issued it."""
     session_id: str
@@ -170,6 +155,7 @@ class HarnessApproval:
     kind: str
     details: tuple[tuple[str, str], ...]
     available_decisions: tuple[str, ...] | None = None
+    permissions_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -202,5 +188,6 @@ class HarnessRequestReceived(HarnessEvent):
 
 @dataclass(frozen=True)
 class HarnessRequestResolved(HarnessEvent):
-    """The request ended, whether answered or cleared."""
-    key: HarnessRequestKey
+    """The request ended; Codex provides the session and request IDs, not the turn ID."""
+    session_id: str
+    request_id: int | str

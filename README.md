@@ -37,8 +37,9 @@ Optional JSON fields:
 
 - `allowed_user_ids`: array of additional Slack user IDs.
 - `allowed_bot_ids`: array of Slack **bot** IDs, not app or bot-user IDs.
-- `codex_command`: executable and argument array, by default
-  `["codex", "app-server"]`. Keep the app server on its stdio transport.
+- `codex_command`: executable followed by optional launcher arguments; defaults to
+  `["codex"]`. The bridge adds `app-server --stdio`. Existing entries that
+  include `app-server` and its stdio transport flags are still accepted.
 - `codex_cwd`: working directory for Codex; by default it inherits yours.
 
 Post a new top-level message from an authorized sender. The bridge adds 👀
@@ -50,7 +51,7 @@ prompt or use `!esc`.
 Only the owner can use approval or input controls and close a session with
 `!done` or `!end`. Approval cards offer **Approve once**, **Approve for session**,
 or **Decline**. Session approvals are handled by Codex, not stored by the bridge.
-Closing interrupts active work, adds ✅ to the initial request, and posts “Bye.”
+Closing requests an interrupt for the known active turn, adds ✅ to the initial request, and posts “Bye.”
 Slack is not used for secret inputs. Joined threads are not yet supported.
 
 ### Continue an inbox session after restart

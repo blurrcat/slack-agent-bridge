@@ -6,14 +6,16 @@ import sys
 import time
 from pathlib import Path
 
-mode = sys.argv[2] if len(sys.argv) > 2 else ""
+assert sys.argv[-2:] == ["app-server", "--stdio"]
+args = sys.argv[1:-2]
+mode = args[1] if len(args) > 1 else ""
 threads = itertools.count(1 if not mode.startswith("missing") else 2)
 turns = itertools.count(1)
 active = {}
 pending = {}
 modes = {}
 held_ack = None
-interrupt_acks = {}
+requested_permissions = {"network": {"enabled": True}}
 
 
 def send(message):
@@ -34,16 +36,18 @@ def approval(thread, turn, prompt):
     request_id = f"approval-for-{turn['id']}"
     pending[request_id] = (thread, prompt)
     send({
-        "id": request_id, "method": "item/commandExecution/requestApproval",
+        "id": request_id,
+        "method": "item/permissions/requestApproval" if prompt == "permissions" else "item/commandExecution/requestApproval",
         "params": {
-            "threadId": thread, "turnId": turn["id"], "command": "echo test",
+            "threadId": thread, "turnId": turn["id"],
+            **({"permissions": requested_permissions} if prompt == "permissions" else {"command": "echo test"}),
             "reason": "Long justification. " * 250 if prompt == "approve-long" else None,
         },
     })
 
 
 def wait_for_gate(suffix):
-    gate = Path(sys.argv[1]).with_suffix(suffix)
+    gate = Path(args[0]).with_suffix(suffix)
     deadline = time.monotonic() + 4
     while not gate.exists():
         if time.monotonic() >= deadline:
@@ -64,6 +68,10 @@ for line in sys.stdin:
         elif prompt == "secret-question":
             assert "error" in message
             received = "rejected"
+        elif prompt == "permissions":
+            result = message["result"]
+            assert result["permissions"] == requested_permissions
+            received = result["scope"]
         else:
             received = message.get("result", {}).get("decision", "rejected")
         send({"method": "serverRequest/resolved", "params": {
@@ -81,10 +89,12 @@ for line in sys.stdin:
         continue
     params = message["params"]
     if method == "initialize":
+        if mode == "stderr":
+            print("test Codex diagnostic", file=sys.stderr, flush=True)
         result = {}
     elif method == "thread/start":
-        if len(sys.argv) > 1:
-            with Path(sys.argv[1]).open("a") as file:
+        if args:
+            with Path(args[0]).open("a") as file:
                 file.write("started\n")
         result = {"thread": {"id": f"codex-{next(threads)}"}}
     elif method == "thread/resume":
@@ -103,6 +113,9 @@ for line in sys.stdin:
     elif method == "turn/start":
         thread = params["threadId"]
         prompt = params["input"][0]["text"]
+        if prompt == "reject-prompt":
+            send({"id": message["id"], "error": {"code": -32600, "message": "prompt rejected"}})
+            continue
         finishing = None
         if (existing := active.pop(thread, None)) is not None:
             if modes[thread] == "finish-before-followup":
@@ -142,9 +155,7 @@ for line in sys.stdin:
             }})
             approval(thread, turn, prompt)
             continue
-        if prompt in {"ack-only-after-interrupt", "ack-never-after-terminal", "hold-ack-reject-interrupt"}:
-            if prompt != "ack-never-after-terminal":
-                interrupt_acks[thread] = message["id"]
+        if prompt == "no-prompt-receipt":
             active[thread] = turn
             modes[thread] = prompt
             send({"method": "item/completed", "params": {
@@ -163,14 +174,14 @@ for line in sys.stdin:
             completed(thread, turn, text)
             send({"id": message["id"], "result": {"turn": turn}})
             continue
-        if prompt in {"hold", "approve", "approve-long", "question", "secret-question", "finish-before-followup", "expire-on-steer"}:
+        if prompt in {"hold", "approve", "approve-long", "permissions", "question", "secret-question", "finish-before-followup", "expire-on-steer"}:
             active[thread] = turn
             modes[thread] = prompt
             send({"method": "item/completed", "params": {
                 "threadId": thread, "turnId": turn["id"],
                 "item": {"type": "commandExecution", "status": "completed", "aggregatedOutput": "DO NOT EXPOSE"},
             }})
-            if prompt in {"approve", "approve-long", "expire-on-steer", "hold", "finish-before-followup"}:
+            if prompt in {"approve", "approve-long", "permissions", "expire-on-steer", "hold", "finish-before-followup"}:
                 approval(thread, turn, prompt)
             elif prompt in {"question", "secret-question"}:
                 request_id = f"question-for-{turn['id']}"
@@ -192,21 +203,19 @@ for line in sys.stdin:
             completed(thread, finishing, "finished before follow-up")
         result = {"turn": turn}
     elif method == "thread/unsubscribe":
-        assert params["threadId"] not in active
-        result = {"status": "unsubscribed"}
+        if args:
+            with Path(args[0]).open("a") as file:
+                file.write("unsubscribe\n")
+        continue  # Unsubscribe does not need to acknowledge a cast.
     elif method == "turn/interrupt":
+        if args:
+            with Path(args[0]).open("a") as file:
+                file.write("interrupt\n")
         thread = params["threadId"]
-        if modes[thread] in {"approve", "hold-ack-reject-interrupt"}:
-            send({"id": message["id"], "error": {"message": "interrupt rejected", "code": -32600}})
-            if thread in interrupt_acks:
-                send({"id": interrupt_acks.pop(thread), "result": {"turn": active[thread]}})
-            continue
         turn = active.pop(thread)
         assert params["turnId"] == turn["id"]
         completed(thread, turn, status="interrupted")
-        if thread in interrupt_acks:
-            send({"id": interrupt_acks.pop(thread), "result": {"turn": turn}})
-        result = {}
+        continue  # The terminal event, not an RPC reply, tells the Bridge what happened.
     else:
         raise AssertionError(method)
     send({"id": message["id"], "result": result})

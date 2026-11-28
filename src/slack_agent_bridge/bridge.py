@@ -14,9 +14,9 @@ from pathlib import Path
 
 from .config import Config
 from .events import (
-    ApprovalDecision, HarnessApproval, HarnessCommandFailed, HarnessEvent, HarnessItemCompleted,
+    ApprovalDecision, HarnessApproval, HarnessEvent, HarnessItemCompleted,
     HarnessQuestion, HarnessQuestions, HarnessRequestKey, HarnessRequestReceived, HarnessRequestResolved,
-    HarnessSessionStopped, HarnessTurnCompleted, HarnessTurnStarted, InputAnswers, SlackApprovalCardPosted,
+    HarnessTurnCompleted, HarnessTurnStarted, InputAnswers, SlackApprovalCardPosted,
     SlackApprovalCardPostFailed, SlackEvent, SlackInteractionReceived, SlackMessage, SlackMessagePosted,
     SlackOriginLookedUp, SlackQuestionsOpenFailed,
     SlackReactionAdded, SlackReactionRemoved, SlackReplyPosted, SlackThread,
@@ -90,11 +90,11 @@ class Bridge:
             case SlackReactionRemoved():
                 self._on_reaction_removed(event)
             case SlackInteractionReceived():
-                self._on_interaction(event)
+                await self._on_interaction(event)
             case SlackApprovalCardPosted():
-                self._on_card_posted(event)
+                await self._on_card_posted(event)
             case SlackApprovalCardPostFailed():
-                self._on_card_post_failed(event)
+                await self._on_card_post_failed(event)
             case SlackOriginLookedUp():
                 await self._on_origin_looked_up(event)
             case SlackQuestionsOpenFailed():
@@ -104,17 +104,13 @@ class Bridge:
             case HarnessItemCompleted():
                 self._on_item_completed(event)
             case HarnessTurnCompleted():
-                self._on_turn_completed(event)
+                await self._on_turn_completed(event)
             case HarnessRequestReceived():
-                self._on_request_received(event)
+                await self._on_request_received(event)
             case HarnessRequestResolved():
                 self._on_request_resolved(event)
-            case HarnessCommandFailed():
-                self._on_command_failed(event)
-            case HarnessSessionStopped():
-                self._on_session_stopped(event)
             case _RecoveryExpired():
-                self._on_recovery_expired(event)
+                await self._on_recovery_expired(event)
             case _:
                 raise BridgeError(f"Unhandled event type: {type(event).__name__}.")
 
@@ -135,7 +131,7 @@ class Bridge:
         self._store.set_state(event.thread, "open", session_id)
         self._outbox.started(event.thread)
         log.info("Opened Agent Session for %s/%s", event.thread.channel_id, event.thread.root_ts)
-        self._harness.send_message(session_id, event.event_id, event.text)
+        await self._harness.send_message(session_id, event.text)
         # Drain buffered replies here so a later reply cannot overtake them.
         for reply in self._awaiting_origin.pop(event.thread, []):
             await self._on_reply_posted(reply)
@@ -149,32 +145,30 @@ class Bridge:
         if session is None:
             await self._continue_saved(event, command)
             return
-        if session.closing is not None or not self._can_reply(event, session.initiator, session.started_by_bot):
+        if not self._can_reply(event, session.initiator, session.started_by_bot):
             return
 
         match command:
             case "!done" | "!end":
                 if event.user_id == self._config.owner_user_id and event.event_id not in session.controls_seen:
                     session.controls_seen.add(event.event_id)
-                    session.closing = event.event_id
-                    self._harness.stop_session(session.id, event.event_id)
+                    await self._close_session(session)
             case "!esc":
-                if not session.turns or event.event_id in session.controls_seen:
+                turn_id = session.current_turn_id
+                if turn_id is None or event.event_id in session.controls_seen:
                     return
                 session.controls_seen.add(event.event_id)
-                turn_id = next(reversed(session.turns))
                 turn = session.turns[turn_id]
                 # A delayed !esc must not interrupt a turn that started after the message.
-                if turn.interrupt is None and _ns(event.message_ts) >= turn.started_at_ns:
-                    turn.interrupt = event.event_id
-                    self._harness.interrupt(session.id, turn_id, event.event_id)
+                if _ns(event.message_ts) >= turn.started_at_ns:
+                    await self._harness.interrupt(session.id, turn_id)
             case _:
                 if not self._store.claim_prompt(event):
                     return
                 if session.prime is not None:
                     session.prime.prompts.append(event)
                 else:
-                    self._harness.send_message(session.id, event.event_id, event.text)
+                    await self._harness.send_message(session.id, event.text)
 
     async def _continue_saved(self, event: SlackReplyPosted, command: str) -> None:
         """Resume a verified mapping; only a confirmed missing session permits replacement."""
@@ -208,7 +202,7 @@ class Bridge:
                 return
             else:
                 self._register(_Session(saved.session_id, event.thread, saved.initiator, saved.started_by_bot))
-                self._harness.send_message(saved.session_id, event.event_id, event.text)
+                await self._harness.send_message(saved.session_id, event.text)
                 log.info("Resumed Agent Session for %s/%s", event.thread.channel_id, event.thread.root_ts)
                 return
         await self._prime_replacement(event, saved)
@@ -247,7 +241,7 @@ class Bridge:
         )
         prime = _Prime(command_id, [event], timer)
         self._register(_Session(session_id, event.thread, saved.initiator, saved.started_by_bot, prime=prime))
-        self._harness.send_message(session_id, prime.command_id, _priming_prompt(event))
+        await self._harness.send_message(session_id, _priming_prompt(event))
 
     def _register(self, session: _Session) -> None:
         """Index one live session by both Slack thread and Harness session ID."""
@@ -262,7 +256,7 @@ class Bridge:
         """Observe an emoji removal without turning it into a command."""
         pass
 
-    def _on_interaction(self, event: SlackInteractionReceived) -> None:
+    async def _on_interaction(self, event: SlackInteractionReceived) -> None:
         """Accept an Owner response only for the right live request and Slack card."""
         if event.workspace_id != self._workspace_id or event.user_id != self._config.owner_user_id:
             return
@@ -270,17 +264,16 @@ class Bridge:
         if control is None or control.answered:
             return
         session = self._by_id.get(control.key.session_id)
-        if session is None or session.closing is not None:
+        if session is None:
             return
-        turn = session.turns.get(control.key.turn_id)
-        if turn is None or turn.interrupt is not None:
+        if control.key.turn_id not in session.turns:
             return
 
         if event.action_id == "bridge:input":
             if not control.modal_opened or not control.questions:
                 return
             if (answers := _answers(control.questions, event)) is not None:
-                self._answer(control, answers)
+                await self._answer(control, answers)
             return
         if event.action_id not in {action for action, _ in control.buttons}:
             return
@@ -298,9 +291,9 @@ class Bridge:
                 control.modal_opened = True
                 self._outbox.open_questions(event.trigger_id, event.value, _modal_questions(control.questions))
         elif (decision := _DECISIONS.get(event.action_id)) is not None:
-            self._answer(control, decision)
+            await self._answer(control, decision)
 
-    def _on_card_posted(self, event: SlackApprovalCardPosted) -> None:
+    async def _on_card_posted(self, event: SlackApprovalCardPosted) -> None:
         """Bind a card timestamp, or disable a card whose request already ended."""
         if (control := self._controls.get(event.token)) is None:
             self._outbox.disable_card(event.thread, event.message_ts)
@@ -308,12 +301,12 @@ class Bridge:
         control.card_ts = event.message_ts
         if (click := control.early_click) is not None:
             control.early_click = None
-            self._on_interaction(click)
+            await self._on_interaction(click)
 
-    def _on_card_post_failed(self, event: SlackApprovalCardPostFailed) -> None:
+    async def _on_card_post_failed(self, event: SlackApprovalCardPostFailed) -> None:
         """Reject a request that the Owner cannot answer in Slack."""
         if (control := self._controls.pop(event.token, None)) is not None:
-            self._harness.reject_request(control.key)
+            await self._harness.reject_request(control.key.request_id)
 
     def _on_questions_open_failed(self, event: SlackQuestionsOpenFailed) -> None:
         """Tell the Owner to retry with a fresh Slack modal trigger."""
@@ -322,13 +315,15 @@ class Bridge:
 
     def _on_turn_started(self, event: HarnessTurnStarted) -> None:
         """Record the turn and its observation time for later interrupt checks."""
-        if (session := self._by_id.get(event.session_id)) is not None:
+        session = self._by_id.get(event.session_id)
+        if session is not None and event.turn_id not in session.turns:
             session.turns[event.turn_id] = _Turn(event.observed_at_ns)
+            session.current_turn_id = event.turn_id
 
     def _on_item_completed(self, event: HarnessItemCompleted) -> None:
         """Cache agent text until the turn ends; do not post tool-status noise."""
         session = self._by_id.get(event.session_id)
-        if session is None or session.closing is not None:
+        if session is None:
             return
         turn = session.turns.get(event.turn_id)
         if turn is None:
@@ -336,17 +331,17 @@ class Bridge:
         if event.kind == "agentMessage":
             turn.answer = event.text or ""
 
-    def _on_turn_completed(self, event: HarnessTurnCompleted) -> None:
+    async def _on_turn_completed(self, event: HarnessTurnCompleted) -> None:
         """Retire turn controls and publish the final reply or resolve recovery."""
         session = self._by_id.get(event.session_id)
         if session is None:
             return
         turn = session.turns.pop(event.turn_id, None)
+        if session.current_turn_id == event.turn_id:
+            session.current_turn_id = None
         self._retire_controls(event.session_id, turn_id=event.turn_id)
-        if session.closing is not None:
-            return
         if session.prime is not None:
-            self._finish_priming(session, bool(turn and turn.answer.strip() == _CONTEXT_READY
+            await self._finish_priming(session, bool(turn and turn.answer.strip() == _CONTEXT_READY
                                               and event.status == "completed"))
             return
         match event.status:
@@ -357,64 +352,52 @@ class Bridge:
             case _:
                 self._outbox.reply(session.thread, "Codex did not complete a text reply.")
 
-    def _on_request_received(self, event: HarnessRequestReceived) -> None:
+    async def _on_request_received(self, event: HarnessRequestReceived) -> None:
         """Present supported, non-secret controls outside recovery turns."""
         session = self._by_id.get(event.key.session_id)
         card = _card(event.request)
         if session is None or session.prime is not None or card is None:
-            self._harness.reject_request(event.key)
+            await self._harness.reject_request(event.key.request_id)
             return
         token = secrets.token_urlsafe(18)
-        self._controls[token] = _Control(event.key, session.thread, card.buttons, card.questions)
+        request = event.request
+        permissions_json = request.permissions_json if isinstance(request, HarnessApproval) else None
+        self._controls[token] = _Control(
+            event.key, session.thread, card.buttons, card.questions, permissions_json=permissions_json,
+        )
         self._outbox.post_card(session.thread, token, card.text, card.buttons)
 
     def _on_request_resolved(self, event: HarnessRequestResolved) -> None:
         """Retire the matching control whether Codex answered or cleared it."""
         for token, control in list(self._controls.items()):
-            if control.key == event.key:
+            if control.key.session_id == event.session_id and control.key.request_id == event.request_id:
                 self._retire_control(token)
 
-    def _on_command_failed(self, event: HarnessCommandFailed) -> None:
-        """Report a failed cast without retrying work whose outcome is unknown."""
-        log.warning("Harness %s failed (command %s).", event.operation, event.command_id)
-        session = self._by_id.get(event.session_id)
-        if session is None:
-            return
-        match event.operation:
-            case "prompt" if session.closing is None:
-                if session.prime is not None and event.command_id == session.prime.command_id:
-                    self._finish_priming(session, False)
-                else:
-                    self._prompt_failed(session.thread)
-            case "interrupt" if event.turn_id is not None and session.closing is None:
-                turn = session.turns.get(event.turn_id)
-                if turn is not None and turn.interrupt == event.command_id:
-                    turn.interrupt = None
-                    self._outbox.reply(session.thread, "Codex did not confirm the interrupt. You can retry !esc.")
-            case "stop" if session.closing == event.command_id:
-                session.closing = None
-                self._outbox.reply(session.thread, "Codex did not confirm the session stopped. You can retry !done.")
-                if session.prime is not None and session.prime.expired:
-                    self._finish_priming(session, False)
+    async def _close_session(self, session: _Session) -> None:
+        """Send any interrupt and unsubscribe before dropping live routing."""
+        await self._stop_harness_session(session)
+        self._drop_session(session)
+        self._finish_close(session.thread)
 
-    def _on_session_stopped(self, event: HarnessSessionStopped) -> None:
-        """Drop live routing once the Harness confirms the session stopped."""
-        if (session := self._by_id.pop(event.session_id, None)) is None:
-            return
+    async def _stop_harness_session(self, session: _Session) -> None:
+        """The Bridge chooses whether to interrupt before detaching."""
+        if session.current_turn_id is not None:
+            await self._harness.interrupt(session.id, session.current_turn_id)
+        await self._harness.stop_session(session.id)
+
+    def _drop_session(self, session: _Session) -> None:
+        self._by_id.pop(session.id)
         self._by_thread.pop(session.thread)
         self._retire_controls(session.id)
         if session.prime is not None:
             session.prime.timer.cancel()
-        self._finish_close(session.thread)
 
-    def _on_recovery_expired(self, event: _RecoveryExpired) -> None:
-        """Reject a matching recovery deadline, without racing an in-progress close."""
+    async def _on_recovery_expired(self, event: _RecoveryExpired) -> None:
+        """Handle a recovery deadline only if it still matches the active attempt."""
         session = self._by_id.get(event.session_id)
         if session is None or session.prime is None or session.prime.command_id != event.command_id:
             return
-        session.prime.expired = True
-        if session.closing is None:
-            self._finish_priming(session, False)
+        await self._finish_priming(session, False)
 
     def _finish_close(self, thread: SlackThread) -> None:
         """Persist the close before queuing the check mark and farewell in that order."""
@@ -423,23 +406,22 @@ class Bridge:
         self._outbox.reply(thread, "Bye.")
         log.info("Closed Agent Session for %s/%s", thread.channel_id, thread.root_ts)
 
-    def _finish_priming(self, session: _Session, ready: bool) -> None:
+    async def _finish_priming(self, session: _Session, ready: bool) -> None:
         """Release held replies only after the replacement confirms recovery."""
         prime = session.prime
         assert prime is not None
-        prime.timer.cancel()
         if not ready:
-            self._by_id.pop(session.id)
-            self._by_thread.pop(session.thread)
-            self._harness.stop_session(session.id, prime.command_id)
+            await self._stop_harness_session(session)
+            self._drop_session(session)
             self._recovery_failed(session.thread)
             return
 
+        prime.timer.cancel()
         session.prime = None
         self._store.set_state(session.thread, "open", session.id)
         log.info("Recovered Agent Session for %s/%s", session.thread.channel_id, session.thread.root_ts)
         for reply in prime.prompts:
-            self._harness.send_message(session.id, reply.event_id, reply.text)
+            await self._harness.send_message(session.id, reply.text)
 
     def _recovery_failed(self, thread: SlackThread) -> None:
         self._outbox.reply(thread, "Codex could not recover the Slack thread history. Your prompt was not run.")
@@ -447,10 +429,12 @@ class Bridge:
     def _prompt_failed(self, thread: SlackThread) -> None:
         self._outbox.reply(thread, "Codex did not confirm the prompt. The bridge did not retry it.")
 
-    def _answer(self, control: _Control, response: ApprovalDecision | InputAnswers) -> None:
-        """Mark the control answered before casting, so duplicate clicks cannot answer twice."""
+    async def _answer(self, control: _Control, response: ApprovalDecision | InputAnswers) -> None:
+        """Mark the control answered before writing, so duplicate clicks cannot answer twice."""
         control.answered = True
-        self._harness.answer_request(control.key, response)
+        await self._harness.answer_request(
+            control.key.request_id, response, permissions_json=control.permissions_json,
+        )
 
     def _retire_controls(self, session_id: str, *, turn_id: str | None = None) -> None:
         """Remove controls for one completed turn or an entire stopped session."""
@@ -522,7 +506,7 @@ class _Session:
     started_by_bot: bool
     controls_seen: set[str] = field(default_factory=set)
     turns: dict[str, _Turn] = field(default_factory=dict)
-    closing: str | None = None
+    current_turn_id: str | None = None
     prime: _Prime | None = None
 
 
@@ -532,7 +516,6 @@ class _Prime:
     command_id: str
     prompts: list[SlackReplyPosted]
     timer: asyncio.TimerHandle
-    expired: bool = False
 
 
 @dataclass(frozen=True)
@@ -556,10 +539,9 @@ class _SavedSession:
 
 @dataclass
 class _Turn:
-    """Bridge's view of a turn: reply text and a possible pending interrupt."""
+    """Bridge's view of a turn: start time and reply text."""
     started_at_ns: int
     answer: str = ""
-    interrupt: str | None = None
 
 
 @dataclass
@@ -569,6 +551,7 @@ class _Control:
     thread: SlackThread
     buttons: tuple[tuple[str, str], ...]
     questions: tuple[HarnessQuestion, ...]
+    permissions_json: str | None = None
     card_ts: str | None = None
     early_click: SlackInteractionReceived | None = None
     modal_opened: bool = False
